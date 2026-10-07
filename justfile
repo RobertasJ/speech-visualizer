@@ -11,23 +11,23 @@ release:
 
 # Run on CPU; extra args go to the binary
 run *args:
-    cargo run --release -- {{args}}
+    cargo run -- {{args}}
 
-# Release build with CUDA
+# Build with CUDA
 build-cuda:
-    cargo build --release --features cuda
+    cargo build --features cuda
 
 # Run with CUDA
 run-cuda *args:
-    cargo run --release --features cuda -- {{args}}
+    cargo run --features cuda -- {{args}}
 
-# Release build with Vulkan
+# Build with Vulkan
 build-vulkan:
-    cargo build --release --features vulkan
+    cargo build --features vulkan
 
 # Run with Vulkan
 run-vulkan *args:
-    cargo run --release --features vulkan -- {{args}}
+    cargo run --features vulkan -- {{args}}
 
 check:
     cargo check

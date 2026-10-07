@@ -1,405 +1,557 @@
-use std::io::Write;
-use std::sync::mpsc;
-use std::time::Instant;
+mod stt;
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, SampleFormat, SizedSample};
-use whisper_rs::{
-    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperError,
-    WhisperState, WhisperVadContext, WhisperVadContextParams, WhisperVadParams,
-};
+use std::cell::Cell;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
-const WHISPER_RATE: u32 = 16_000;
-// Whisper rejects clips shorter than 1 s, so wait for this much before the first pass.
-const MIN_SECS: u32 = 1;
-// The VAD resets on every call, so each loop it looks at this much of the newest audio.
-const VAD_CONTEXT_SECS: u32 = 3;
-// Silence this long ends a section (also the VAD's min_silence_duration_ms).
-const PAUSE_MS: u32 = 300;
-// Audio kept before the detected start of speech, so the first word isn't clipped.
-const PRE_ROLL_MS: u32 = 200;
-// Silence after the speech that's included in a section's final pass.
-const TRAILING_SILENCE_MS: u32 = 300;
-// Past this length, a long section is cut where two passes agree on a segment end.
-const FORCE_CUT_SECS: u32 = 20;
-// How far a segment end may move between passes and still count as agreeing.
-const CUT_TOLERANCE_MS: i64 = 200;
-// Whisper's limit: a section this long is finalized even without a pause or agreed cut.
-const MAX_SECTION_SECS: u32 = 30;
-// Whisper's language detection is slow and often wrong, so fix it to English for now.
-const LANG: Option<&str> = Some("en");
-// The VAD threshold: 0.0 = always speech, 1.0 = always silence.
-const VAD_THRESHOLD: f32 = 0.5;
+use freya::prelude::*;
+use futures_channel::{mpsc, oneshot};
+use futures_lite::StreamExt;
+
+use stt::{Config, DeviceInfo, Event, Timing, Transcriber};
+
+/// Language codes offered in the selection, with "auto" for whisper's detection.
+const LANGUAGES: &[(&str, &str)] = &[
+    ("en", "English"),
+    ("auto", "Auto-detect"),
+    ("lt", "Lithuanian"),
+    ("de", "German"),
+    ("fr", "French"),
+    ("es", "Spanish"),
+    ("pl", "Polish"),
+    ("ru", "Russian"),
+    ("uk", "Ukrainian"),
+];
+// Range of the pause slider; the default is what the terminal version used.
+const PAUSE_MIN_MS: u32 = 100;
+const PAUSE_MAX_MS: u32 = 1000;
+const PAUSE_DEFAULT_MS: u32 = 300;
+// How many of the latest updates the diagnostics average over.
+const DIAG_WINDOW: usize = 20;
 
 fn main() {
-    let usage = "usage: just run <path/to/ggml-model.bin> <path/to/ggml-silero.bin>";
-    let model_path = std::env::args().nth(1).expect(usage);
-    let vad_path = std::env::args().nth(2).expect(usage);
+    // Model files (.bin) are picked from this directory; VAD models have "silero" in the name.
+    let models_dir = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "models".into()));
 
-    // Route whisper.cpp's log output into whisper-rs, which drops it without a log backend.
-    whisper_rs::install_logging_hooks();
-
-    // --- Whisper: load the model once, reuse the state for every chunk ---
-    let ctx = WhisperContext::new_with_params(&model_path, WhisperContextParameters::default())
-        .expect("failed to load model");
-    let mut state = ctx.create_state().expect("failed to create state");
-
-    // --- VAD: silero, only used to find where speech starts and pauses ---
-    let mut vad = WhisperVadContext::new(&vad_path, WhisperVadContextParams::default())
-        .expect("failed to load VAD model");
-
-    // --- Mic: default input device at its native rate/format ---
-    let host = cpal::default_host();
-    let device = host.default_input_device().expect("no input device");
-    let supported = device
-        .default_input_config()
-        .expect("no default input config");
-
-    let device_rate = supported.sample_rate();
-    let channels = supported.channels() as usize;
-    let sample_format = supported.sample_format();
-    let stream_config: cpal::StreamConfig = supported.into();
-
-    println!(
-        "{DIM}Recording from '{}' at {} Hz, {} channel(s). Ctrl+C to stop.{RESET}",
-        device
-            .description()
-            .map(|d| d.name().to_owned())
-            .unwrap_or_default(),
-        device_rate,
-        channels
-    );
-
-    // The audio callback runs on cpal's thread and sends mono chunks here.
-    let (tx, rx) = mpsc::channel::<Vec<f32>>();
-
-    let stream = match sample_format {
-        SampleFormat::F32 => build_stream::<f32>(&device, stream_config, channels, tx),
-        SampleFormat::I16 => build_stream::<i16>(&device, stream_config, channels, tx),
-        SampleFormat::U16 => build_stream::<u16>(&device, stream_config, channels, tx),
-        other => panic!("unsupported sample format: {other:?}"),
-    };
-    stream.play().expect("failed to start input stream");
-
-    // --- Main loop: sections of speech cut at pauses, re-transcribed until final ---
-    let samples = |ms: u32| (device_rate as u64 * ms as u64 / 1000) as usize;
-    let min_len = samples(MIN_SECS * 1000);
-    let vad_len = samples(VAD_CONTEXT_SECS * 1000);
-    let pause_len = samples(PAUSE_MS);
-    let pre_roll = samples(PRE_ROLL_MS);
-    let trailing = samples(TRAILING_SILENCE_MS);
-    let force_len = samples(FORCE_CUT_SECS * 1000);
-    let max_len = samples(MAX_SECTION_SECS * 1000);
-
-    // Device-rate audio: the open section, plus whatever came before it that the VAD
-    // and pre-roll still need. While idle only the newest VAD_CONTEXT_SECS are kept.
-    let mut buf: Vec<f32> = Vec::new();
-    // Start of the open section in `buf`; None while idle.
-    let mut section: Option<usize> = None;
-    // Where the VAD last saw speech end in `buf`, while a section is open.
-    let mut speech_end = 0usize;
-    // Segments of the previous pass over the open section, to agree on a cut point.
-    let mut prev: Vec<Segment> = Vec::new();
-    // Text of the open section, shown as the dimmed live tail.
-    let mut live = String::new();
-    let mut elapsed_ms = 0u128;
-    // Transcript words on the current terminal line (earlier lines are printed for good).
-    let mut line = String::new();
-    // Last (line, live) drawn, so unchanged passes don't redraw (and flicker).
-    let mut last_drawn = (String::new(), String::new());
-
-    loop {
-        // Block until there's new audio, then take everything that queued up while
-        // the previous pass was running so we always work on the latest audio.
-        buf.extend(rx.recv().expect("audio channel closed"));
-        while let Ok(more) = rx.try_recv() {
-            buf.extend(more);
-        }
-
-        // VAD over the newest few seconds. On error (e.g. too little audio yet) just
-        // wait for more.
-        let ctx_start = buf.len().saturating_sub(vad_len);
-        let Ok(speech) = detect_speech(&mut vad, &buf[ctx_start..], device_rate) else {
-            continue;
-        };
-        // A pause: no speech at all, or the last speech ended at least PAUSE_MS ago.
-        let paused = speech.is_none_or(|(_, end)| buf.len() - (ctx_start + end) >= pause_len);
-
-        let start = match (section, speech) {
-            (Some(start), _) => {
-                if let Some((_, end)) = speech {
-                    speech_end = ctx_start + end;
-                }
-                start
-            }
-            // Speech while idle opens a section, starting a little before it.
-            (None, Some((first, end))) => {
-                let start = (ctx_start + first).saturating_sub(pre_roll);
-                section = Some(start);
-                speech_end = ctx_start + end;
-                prev.clear();
-                start
-            }
-            // Still idle: audio outside a section is never transcribed.
-            (None, None) => {
-                buf.drain(..buf.len().saturating_sub(vad_len));
-                continue;
-            }
-        };
-
-        let cols = terminal_size::terminal_size().map_or(80, |(w, _)| w.0 as usize);
-        let mut out = std::io::stdout().lock();
-        let len = buf.len() - start;
-
-        if paused || len >= max_len {
-            // The section is over: one final pass over all of it (after a pause, with a
-            // little of the trailing silence). Its text is never revised.
-            let end = if paused {
-                (speech_end + trailing).clamp(start, buf.len())
-            } else {
-                start + max_len
-            };
-            let segments;
-            (segments, elapsed_ms) = transcribe(&mut state, &buf[start..end], device_rate);
-            append_final(&mut out, &mut line, &joined(&segments), cols);
-            buf.drain(..end);
-            section = None;
-            prev.clear();
-            live.clear();
-        } else if len >= min_len {
-            let (mut segments, ms) = transcribe(&mut state, &buf[start..], device_rate);
-            elapsed_ms = ms;
-
-            // A long section is cut at a segment end both passes agree on: the text up
-            // to there is final, and the rest of the audio starts a new open section.
-            if len >= force_len
-                && let Some(k) = agreed_cut(&prev, &segments)
-            {
-                let cut_cs = segments[k].end_cs;
-                let cut = (start + cs_to_samples(cut_cs, device_rate)).min(buf.len());
-                append_final(&mut out, &mut line, &joined(&segments[..=k]), cols);
-                buf.drain(..cut);
-                section = Some(0);
-                speech_end = speech_end.saturating_sub(cut);
-                // Keep the rest relative to the new section start for the next comparison.
-                segments.drain(..=k);
-                for seg in &mut segments {
-                    seg.end_cs -= cut_cs;
-                }
-            }
-
-            live = joined(&segments);
-            prev = segments;
-        }
-
-        if (line.as_str(), live.as_str()) != (last_drawn.0.as_str(), last_drawn.1.as_str()) {
-            draw_live(&mut out, &line, &live, elapsed_ms, cols);
-            out.flush().ok();
-            last_drawn = (line.clone(), live.clone());
-        }
-    }
-}
-
-const DIM: &str = "\x1b[2m";
-const RESET: &str = "\x1b[0m";
-/// Width of the "12345 ms │ " column in front of every line.
-const GUTTER: usize = 11;
-
-/// A whisper output segment: its text and where it ends, in centiseconds from the
-/// start of the audio it was transcribed from.
-struct Segment {
-    text: String,
-    end_cs: i64,
-}
-
-/// Runs the VAD over `audio` (device rate) and returns where speech first starts and
-/// last ends, in device samples from the start of `audio`, or None without speech.
-fn detect_speech(
-    vad: &mut WhisperVadContext,
-    audio: &[f32],
-    rate: u32,
-) -> Result<Option<(usize, usize)>, WhisperError> {
-    let samples = resample_linear(audio, rate, WHISPER_RATE);
-    let mut params = WhisperVadParams::new();
-    params.set_min_silence_duration(PAUSE_MS as i32);
-    params.set_threshold(VAD_THRESHOLD);
-    let found: Vec<_> = vad.segments_from_samples(params, &samples)?.collect();
-    let (Some(first), Some(last)) = (found.first(), found.last()) else {
-        return Ok(None);
-    };
-    // VAD times are in centiseconds.
-    let at = |cs: f32| cs_to_samples(cs as i64, rate).min(audio.len());
-    Ok(Some((at(first.start), at(last.end))))
-}
-
-/// Transcribes `audio` (device rate) in one pass and returns its segments and how
-/// long the pass took in ms.
-fn transcribe(state: &mut WhisperState, audio: &[f32], rate: u32) -> (Vec<Segment>, u128) {
-    let mut audio = resample_linear(audio, rate, WHISPER_RATE);
-    // A final pass can be shorter than whisper's 1 s minimum; pad it with silence.
-    audio.resize(audio.len().max((WHISPER_RATE * MIN_SECS) as usize), 0.0);
-
-    // FullParams is consumed by full(), so build a fresh one per pass.
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_language(LANG); // "auto" = detect; e.g. "en" to fix it
-    // Every pass re-transcribes the section, so conditioning on earlier text would repeat it.
-    params.set_no_context(true);
-    params.set_single_segment(false); // segment ends are the candidate cut points
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_special(false);
-    params.set_print_timestamps(false);
-    params.set_suppress_nst(true); // drop non-speech tokens like "[Music]"
-
-    let started = Instant::now();
-    state.full(params, &audio).expect("transcription failed");
-    let elapsed_ms = started.elapsed().as_millis();
-
-    let segments = state
-        .as_iter()
-        .map(|seg| Segment {
-            text: seg.to_string(),
-            end_cs: seg.end_timestamp(),
-        })
-        .collect();
-    (segments, elapsed_ms)
-}
-
-/// The latest segment end (never the last segment of `cur`) where both passes agree:
-/// the same text up to there, ignoring case and punctuation, and an end time within
-/// CUT_TOLERANCE_MS.
-fn agreed_cut(prev: &[Segment], cur: &[Segment]) -> Option<usize> {
-    (0..cur.len().saturating_sub(1)).rev().find(|&k| {
-        k < prev.len()
-            && (prev[k].end_cs - cur[k].end_cs).abs() * 10 <= CUT_TOLERANCE_MS
-            && normalize(&joined(&prev[..=k])) == normalize(&joined(&cur[..=k]))
-    })
-}
-
-/// The segments' text with annotations removed and whitespace collapsed.
-fn joined(segments: &[Segment]) -> String {
-    let text: Vec<&str> = segments.iter().map(|s| s.text.as_str()).collect();
-    strip_annotations(&text.join(" "))
-}
-
-/// Lowercases and drops punctuation, so "Hello, world." and "hello world" compare equal.
-fn normalize(text: &str) -> String {
-    let kept: String = text
-        .chars()
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect();
-    kept.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn cs_to_samples(cs: i64, rate: u32) -> usize {
-    (cs.max(0) as u64 * rate as u64 / 100) as usize
-}
-
-/// Appends final text to the transcript line, printing the line for good whenever
-/// the next word wouldn't fit.
-fn append_final(out: &mut impl Write, line: &mut String, text: &str, cols: usize) {
-    for word in text.split_whitespace() {
-        // Wrap the transcript ourselves; a wrapped line can't be redrawn with `\r`.
-        if !line.is_empty() && GUTTER + line.chars().count() + 1 + word.chars().count() >= cols {
-            writeln!(out, "\r{DIM}{:>GUTTER$}{RESET}{line}\x1b[K", "│ ").ok();
-            line.clear();
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-}
-
-/// Redraws the current line in place: the settled transcript, then the live tail
-/// dimmed. If the tail doesn't fit, only its end is shown.
-fn draw_live(out: &mut impl Write, line: &str, live: &str, elapsed_ms: u128, cols: usize) {
-    let used = GUTTER + line.chars().count() + usize::from(!line.is_empty());
-    let room = cols.saturating_sub(used + 1);
-
-    let len = live.chars().count();
-    let shown: String = if len > room {
-        let tail: String = live.chars().skip(len - room + 1).collect();
-        format!("…{tail}")
-    } else {
-        live.to_owned()
-    };
-    let sep = if line.is_empty() { "" } else { " " };
-    // Overwrite in place and clear only what's left after the text (\x1b[K), instead
-    // of blanking the line first. \x1b[?2026h/l wraps it in a synchronized update so
-    // terminals that support it paint the frame at once (others ignore it).
-    write!(
-        out,
-        "\x1b[?2026h\r{DIM}{elapsed_ms:>5} ms │ {RESET}{line}{sep}{DIM}{shown}{RESET}\x1b[K\x1b[?2026l"
+    launch(
+        LaunchConfig::new().with_window(
+            WindowConfig::new_app(SpeechApp { models_dir })
+                .with_size(900., 600.)
+                .with_title("Speech visualizer"),
+        ),
     )
-    .ok();
 }
 
-/// Removes Whisper's bracketed annotations ("[BLANK_AUDIO]", "(music)", ...)
-/// and collapses whitespace.
-fn strip_annotations(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut depth = 0u32;
-    for c in text.chars() {
-        match c {
-            '[' | '(' => depth += 1,
-            ']' | ')' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => out.push(c),
-            _ => {}
+/// What the user picked on the selection screen.
+#[derive(Clone, PartialEq)]
+struct Options {
+    model: Option<PathBuf>,
+    vad: Option<PathBuf>,
+    language: &'static str,
+    pause_ms: u32,
+}
+
+struct SpeechApp {
+    models_dir: PathBuf,
+}
+
+impl App for SpeechApp {
+    fn render(&self) -> impl IntoElement {
+        // Follow the OS light/dark preference.
+        let mut theme = use_init_theme(|| Platform::get().preferred_theme.read().to_theme());
+        use_side_effect(move || theme.set(Platform::get().preferred_theme.read().to_theme()));
+
+        // Kept here, so going back to the selection shows the last choices.
+        let options = use_state(|| Options {
+            model: None,
+            vad: None,
+            language: LANGUAGES[0].0,
+            pause_ms: PAUSE_DEFAULT_MS,
+        });
+        let running = use_state(|| false);
+
+        let screen = if running() {
+            Session {
+                options: options.read().clone(),
+                running,
+            }
+            .into_element()
+        } else {
+            Selection {
+                models_dir: self.models_dir.clone(),
+                options,
+                running,
+            }
+            .into_element()
+        };
+
+        rect()
+            .expanded()
+            .theme_background()
+            .theme_color()
+            .child(screen)
+    }
+}
+
+/// The options form; Start switches to a [`Session`].
+#[derive(PartialEq)]
+struct Selection {
+    models_dir: PathBuf,
+    options: State<Options>,
+    running: State<bool>,
+}
+
+impl Component for Selection {
+    fn render(&self) -> impl IntoElement {
+        let mut options = self.options;
+        let mut running = self.running;
+
+        // Scanned on every visit, so models added in the meantime show up.
+        let (models, vads, scan_error) = use_hook(|| match bin_files(&self.models_dir) {
+            Ok(files) => {
+                let (vads, models) = files.into_iter().partition(|path| is_vad(path));
+                (models, vads, None)
+            }
+            Err(err) => (
+                Vec::new(),
+                Vec::new(),
+                Some(format!("Can't read {}: {err}", self.models_dir.display())),
+            ),
+        });
+        // Keep earlier picks that still exist, otherwise default to the first file.
+        use_hook({
+            let (models, vads) = (models.clone(), vads.clone());
+            move || {
+                let mut options = options.write();
+                if !options.model.as_ref().is_some_and(|m| models.contains(m)) {
+                    options.model = models.first().cloned();
+                }
+                if !options.vad.as_ref().is_some_and(|v| vads.contains(v)) {
+                    options.vad = vads.first().cloned();
+                }
+            }
+        });
+
+        let current = options.read().clone();
+        let colors = use_theme().read().colors.clone();
+        let can_start = current.model.is_some() && current.vad.is_some();
+
+        let language = Select::new()
+            .selected_item(language_name(current.language))
+            .children(LANGUAGES.iter().map(|&(code, name)| {
+                MenuItem::new()
+                    .selected(current.language == code)
+                    .on_press(move |_| options.write().language = code)
+                    .child(name)
+            }));
+
+        let pause_value =
+            (current.pause_ms - PAUSE_MIN_MS) as f64 * 100. / (PAUSE_MAX_MS - PAUSE_MIN_MS) as f64;
+        let pause = Slider::new(move |value: f64| {
+            let ms = PAUSE_MIN_MS as f64 + value / 100. * (PAUSE_MAX_MS - PAUSE_MIN_MS) as f64;
+            // Snap to 10 ms steps.
+            options.write().pause_ms = (ms / 10.).round() as u32 * 10;
+        })
+        .value(pause_value)
+        .size(Size::px(250.));
+
+        let mut form = rect()
+            .width(Size::px(420.))
+            .spacing(16.)
+            .child(label().text("Speech visualizer").font_size(26.))
+            .child(field(
+                "Whisper model",
+                file_select(&models, &current.model, move |path| {
+                    options.write().model = Some(path)
+                }),
+            ))
+            .child(field(
+                "VAD model",
+                file_select(&vads, &current.vad, move |path| {
+                    options.write().vad = Some(path)
+                }),
+            ))
+            .child(field("Language", language))
+            .child(field(
+                format!("Pause that ends a section: {} ms", current.pause_ms),
+                pause,
+            ));
+
+        if let Some(scan_error) = scan_error {
+            form = form.child(label().text(scan_error).color(colors.error));
+        } else if !can_start {
+            form = form.child(
+                label()
+                    .text(format!(
+                        "Put a whisper model and a silero VAD model (.bin) in {}.",
+                        self.models_dir.display()
+                    ))
+                    .color(colors.text_secondary),
+            );
+        }
+
+        rect().expanded().center().child(
+            form.child(
+                Button::new()
+                    .filled()
+                    .enabled(can_start)
+                    .on_press(move |_| running.set(true))
+                    .child("Start"),
+            ),
+        )
+    }
+}
+
+/// A labelled row of the selection form.
+fn field(title: impl Into<String>, input: impl IntoElement) -> impl IntoElement {
+    rect()
+        .spacing(6.)
+        .child(label().text(title.into()).font_size(14.))
+        .child(input)
+}
+
+/// A dropdown of `files`, showing their file names.
+fn file_select(
+    files: &[PathBuf],
+    selected: &Option<PathBuf>,
+    on_pick: impl FnMut(PathBuf) + Clone + 'static,
+) -> impl IntoElement {
+    let shown = selected.as_deref().map_or("None found".into(), file_name);
+    Select::new()
+        .selected_item(shown)
+        .children(files.iter().map(|path| {
+            let mut on_pick = on_pick.clone();
+            let picked = path.clone();
+            MenuItem::new()
+                .selected(selected.as_ref() == Some(path))
+                .on_press(move |_| on_pick(picked.clone()))
+                .child(file_name(path))
+        }))
+}
+
+/// Where the transcriber is, as shown in the top bar.
+enum Status {
+    Loading,
+    Listening(DeviceInfo),
+    Stopped,
+    Failed(String),
+}
+
+/// A running transcription. Its transcriber is started on mount and stopped when it
+/// unmounts, i.e. when going back to the selection.
+#[derive(PartialEq)]
+struct Session {
+    options: Options,
+    running: State<bool>,
+}
+
+impl Component for Session {
+    fn render(&self) -> impl IntoElement {
+        let mut running = self.running;
+        let mut status = use_state(|| Status::Loading);
+        let mut transcript = use_state(String::new);
+        let mut live = use_state(String::new);
+        let mut diagnostics = use_state(Diagnostics::default);
+        // When the latest update arrived, until the render that shows it takes it.
+        let arrived = use_hook(|| Rc::new(Cell::new(None::<Instant>)));
+        // How long after arriving the latest update was rendered.
+        let render_lag = use_hook(|| Rc::new(Cell::new(None::<Duration>)));
+        let mut errors = use_state(Vec::<String>::new);
+        let mut scroll = use_scroll_controller(|| ScrollConfig {
+            default_vertical_position: ScrollPosition::End,
+            ..Default::default()
+        });
+
+        use_hook(|| {
+            let options = &self.options;
+            let config = Config {
+                model_path: options.model.clone().unwrap_or_default(),
+                vad_path: options.vad.clone().unwrap_or_default(),
+                language: (options.language != "auto").then(|| options.language.to_owned()),
+                pause_ms: options.pause_ms,
+            };
+
+            // start() blocks while the models load, so it runs on its own thread. If the
+            // session is gone by the time it's done, the transcriber is dropped right there.
+            let (setup_tx, setup_rx) = oneshot::channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded();
+            std::thread::spawn(move || {
+                let started = Transcriber::start(config, move |event| {
+                    let _ = event_tx.unbounded_send(event);
+                });
+                let _ = setup_tx.send(started);
+            });
+
+            // Cancelled when the session unmounts, which drops the transcriber.
+            let arrived = arrived.clone();
+            spawn(async move {
+                let transcriber = match setup_rx.await {
+                    Ok(Ok(transcriber)) => transcriber,
+                    Ok(Err(err)) => {
+                        status.set(Status::Failed(err.to_string()));
+                        return;
+                    }
+                    Err(_) => {
+                        status.set(Status::Failed("the setup thread panicked".into()));
+                        return;
+                    }
+                };
+                status.set(Status::Listening(transcriber.device().clone()));
+                let _transcriber = StopInBackground(Some(transcriber));
+
+                // The event channel closes when the transcription thread ends.
+                while let Some(event) = event_rx.next().await {
+                    match event {
+                        Event::Live {
+                            text,
+                            pass_ms,
+                            timing,
+                        } => {
+                            diagnostics.write().record("live", pass_ms, timing);
+                            arrived.set(Some(Instant::now()));
+                            live.set(text);
+                        }
+                        Event::Final {
+                            text,
+                            pass_ms,
+                            timing,
+                            ..
+                        } => {
+                            diagnostics.write().record("final", pass_ms, timing);
+                            arrived.set(Some(Instant::now()));
+                            if !text.is_empty() {
+                                let mut transcript = transcript.write();
+                                if !transcript.is_empty() {
+                                    transcript.push(' ');
+                                }
+                                transcript.push_str(&text);
+                            }
+                            live.set(String::new());
+                        }
+                        Event::Error(err) => errors.write().push(err),
+                    }
+                    scroll.scroll_to(ScrollPosition::End, Direction::Vertical);
+                }
+                status.set(Status::Stopped);
+            });
+        });
+
+        if let Some(at) = arrived.take() {
+            let lag = at.elapsed();
+            render_lag.set(Some(lag));
+            eprintln!("[diag] render {:.1} ms after arriving", ms_f64(lag));
+        }
+
+        let colors = use_theme().read().colors.clone();
+
+        let status_text = match &*status.read() {
+            Status::Loading => "Loading models…".to_owned(),
+            Status::Listening(device) => format!(
+                "Recording from '{}' at {} Hz, {} channel(s)",
+                device.name, device.sample_rate, device.channels
+            ),
+            Status::Stopped => "Stopped".to_owned(),
+            Status::Failed(err) => format!("Failed to start: {err}"),
+        };
+
+        let top_bar = rect()
+            .horizontal()
+            .width(Size::fill())
+            .padding(10.)
+            .spacing(12.)
+            .cross_align(Alignment::center())
+            .background(colors.surface_primary)
+            .child(
+                Button::new()
+                    .on_press(move |_| running.set(false))
+                    .child("← Back to selection"),
+            )
+            .child(
+                label()
+                    .width(Size::flex(1.))
+                    .max_lines(1)
+                    .text_overflow(TextOverflow::Ellipsis)
+                    .text(status_text)
+                    .color(colors.text_secondary),
+            )
+            .child(
+                label()
+                    .text(format!(
+                        "{} ms",
+                        diagnostics.read().last.as_ref().map_or(0, |u| u.pass_ms)
+                    ))
+                    .font_tabular()
+                    .color(colors.text_secondary),
+            );
+        let diagnostics_bar = label()
+            .width(Size::fill())
+            .padding((4., 12.))
+            .font_size(12.)
+            .font_tabular()
+            .text(diagnostics.read().summary(render_lag.get()))
+            .color(colors.text_secondary);
+
+        let sep = if transcript.read().is_empty() {
+            ""
+        } else {
+            " "
+        };
+        let text = paragraph()
+            .width(Size::fill())
+            .font_size(22.)
+            .line_height(1.4)
+            .span(Span::new(transcript.read().clone()))
+            .span(Span::new(format!("{sep}{}", live.read())).color(colors.text_secondary));
+
+        rect()
+            .expanded()
+            .content(Content::Flex)
+            .child(top_bar)
+            .child(diagnostics_bar)
+            .children(errors.read().iter().map(|err| {
+                label()
+                    .padding((4., 12.))
+                    .text(err.clone())
+                    .color(colors.error)
+                    .into_element()
+            }))
+            .child(
+                ScrollView::new_controlled(scroll)
+                    .width(Size::fill())
+                    .height(Size::flex(1.))
+                    .child(rect().padding(20.).child(text)),
+            )
+    }
+}
+
+/// Timings of the latest text updates (Live and Final events), shown under the top bar
+/// and logged to stderr.
+#[derive(Default)]
+struct Diagnostics {
+    last: Option<Update>,
+    /// Gaps between the latest updates arriving, in ms.
+    intervals: VecDeque<u32>,
+    /// Passes behind the latest updates, in ms.
+    passes: VecDeque<u32>,
+}
+
+struct Update {
+    pass_ms: u32,
+    timing: Timing,
+    arrived: Instant,
+    /// From the worker sending the event to it arriving here.
+    to_ui: Duration,
+    /// Since the update before it arrived.
+    interval_ms: Option<u32>,
+}
+
+impl Diagnostics {
+    fn record(&mut self, kind: &str, pass_ms: u32, timing: Timing) {
+        let now = Instant::now();
+        let interval_ms = self
+            .last
+            .as_ref()
+            .map(|last| now.duration_since(last.arrived).as_millis() as u32);
+        let update = Update {
+            pass_ms,
+            timing,
+            arrived: now,
+            to_ui: now.duration_since(timing.sent_at),
+            interval_ms,
+        };
+        if let Some(interval) = interval_ms {
+            push_window(&mut self.intervals, interval);
+        }
+        push_window(&mut self.passes, pass_ms);
+        eprintln!("[diag] {kind:5} {}", update.describe());
+        self.last = Some(update);
+    }
+
+    fn summary(&self, render_lag: Option<Duration>) -> String {
+        let Some(last) = &self.last else {
+            return "No updates yet".into();
+        };
+        let interval = match last.interval_ms {
+            Some(ms) => format!("{ms} ms (avg {} ms)", average(&self.intervals)),
+            None => "-".into(),
+        };
+        let render = render_lag.map_or("-".into(), |lag| format!("{:.1} ms", ms_f64(lag)));
+        format!(
+            "update every {interval} · {} · avg whisper {} ms · to render {render}",
+            last.describe(),
+            average(&self.passes),
+        )
+    }
+}
+
+impl Update {
+    fn describe(&self) -> String {
+        let t = &self.timing;
+        format!(
+            "whisper {} ms for {:.1} s audio · VAD {} ms · waited {} ms for {} ms new audio · to UI {:.1} ms",
+            self.pass_ms,
+            t.audio_ms as f64 / 1000.,
+            t.vad_ms,
+            t.wait_ms,
+            t.new_audio_ms,
+            ms_f64(self.to_ui),
+        )
+    }
+}
+
+fn push_window(window: &mut VecDeque<u32>, value: u32) {
+    if window.len() == DIAG_WINDOW {
+        window.pop_front();
+    }
+    window.push_back(value);
+}
+
+fn average(window: &VecDeque<u32>) -> u32 {
+    let sum: u64 = window.iter().map(|&v| v as u64).sum();
+    (sum / window.len().max(1) as u64) as u32
+}
+
+fn ms_f64(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.
+}
+
+/// Owns the transcriber and drops it on a separate thread: dropping waits for the pass in
+/// progress, which would otherwise freeze the window.
+struct StopInBackground(Option<Transcriber>);
+
+impl Drop for StopInBackground {
+    fn drop(&mut self) {
+        if let Some(transcriber) = self.0.take() {
+            std::thread::spawn(move || drop(transcriber));
         }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Builds an input stream for sample type `T`, converts samples to f32,
-/// and downmixes interleaved channels to mono before sending them on.
-fn build_stream<T>(
-    device: &cpal::Device,
-    config: cpal::StreamConfig,
-    channels: usize,
-    tx: mpsc::Sender<Vec<f32>>,
-) -> cpal::Stream
-where
-    T: SizedSample,
-    f32: FromSample<T>,
-{
-    device
-        .build_input_stream(
-            config,
-            move |data: &[T], _: &cpal::InputCallbackInfo| {
-                // Interleaved: [L, R, L, R, ...] for stereo. Average each frame.
-                let mono: Vec<f32> = data
-                    .chunks(channels)
-                    .map(|frame| {
-                        frame.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / channels as f32
-                    })
-                    .collect();
-                let _ = tx.send(mono);
-            },
-            |err| eprintln!("stream error: {err}"),
-            None,
-        )
-        .expect("failed to build input stream")
+/// The .bin files in `dir`, sorted by name.
+fn bin_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "bin"))
+        .collect();
+    files.sort();
+    Ok(files)
 }
 
-/// Simple linear-interpolation resampler (no low-pass filter, so a little
-/// aliasing when downsampling, which is fine for a test).
-fn resample_linear(input: &[f32], from: u32, to: u32) -> Vec<f32> {
-    if from == to || input.is_empty() {
-        return input.to_vec();
-    }
-    let ratio = from as f64 / to as f64;
-    let out_len = (input.len() as f64 / ratio) as usize;
+fn is_vad(path: &Path) -> bool {
+    file_name(path).contains("silero")
+}
 
-    (0..out_len)
-        .map(|i| {
-            let pos = i as f64 * ratio;
-            let idx = pos as usize;
-            let frac = (pos - idx as f64) as f32;
-            let a = input[idx];
-            let b = *input.get(idx + 1).unwrap_or(&a);
-            a + (b - a) * frac
-        })
-        .collect()
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn language_name(code: &str) -> &'static str {
+    LANGUAGES
+        .iter()
+        .find(|&&(c, _)| c == code)
+        .map_or("Unknown", |&(_, name)| name)
 }

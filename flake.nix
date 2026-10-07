@@ -11,6 +11,20 @@
         config.allowUnfree = true; # CUDA
       };
       cuda = pkgs.cudaPackages.cudatoolkit;
+      # Freya (from its flake.nix): window, GL rendering and fonts. Most are dlopen'ed at
+      # runtime, so they also go on LD_LIBRARY_PATH. Its GTK/WebKit libs are left out;
+      # they're only for the tray and webview features.
+      freyaLibraries = with pkgs; [
+        fontconfig
+        freetype
+        libGL
+        libxkbcommon
+        wayland
+        libx11
+        libxcursor
+        libxi
+        libxrandr
+      ];
     in
     {
       devShells.${system}.default =
@@ -26,7 +40,7 @@
             alsa-lib # cpal audio backend
             vulkan-headers
             vulkan-loader
-          ];
+          ] ++ freyaLibraries;
 
           CUDA_PATH = cuda;
           CUDAToolkit_ROOT = cuda;
@@ -36,7 +50,7 @@
           # whisper-rs-sys only searches /usr/local/cuda and /opt/cuda for link libs.
           RUSTFLAGS = "-L ${cuda}/lib -L ${cuda}/lib/stubs";
           # Real libcuda.so comes from the NixOS driver at runtime.
-          LD_LIBRARY_PATH = "/run/opengl-driver/lib";
+          LD_LIBRARY_PATH = "/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath freyaLibraries}";
         };
     };
 }
