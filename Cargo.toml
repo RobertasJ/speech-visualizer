@@ -1,0 +1,14 @@
+[package]
+name = "speech-visualizer"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = [] # CPU; enable `cuda` or `vulkan` for GPU
+cuda = ["whisper-rs/cuda"]
+vulkan = ["whisper-rs/vulkan"]
+
+[dependencies]
+cpal = "0.18"
+terminal_size = "0.4"
+whisper-rs = "0.16"
