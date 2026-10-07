@@ -1,3 +1,5 @@
+mod display;
+mod scene;
 mod stt;
 
 use std::cell::Cell;
@@ -7,9 +9,11 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use freya::prelude::*;
+use freya::winit::window::WindowId;
 use futures_channel::{mpsc, oneshot};
 use futures_lite::StreamExt;
 
+use scene::{Command, Scene, SceneSender};
 use stt::{Config, DeviceInfo, Event, Timing, Transcriber};
 
 /// Language codes offered in the selection, with "auto" for whisper's detection.
@@ -35,13 +39,48 @@ fn main() {
     // Model files (.bin) are picked from this directory; VAD models have "silero" in the name.
     let models_dir = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "models".into()));
 
+    // Shared with the display window, which can be opened and closed independently.
+    let scene = State::create_global(Scene::default());
+    let display = State::create_global(None);
+    // Commands from every SceneSender (any thread) are applied here, on the UI thread.
+    let (commands, receiver) = scene::channel();
+
     launch(
-        LaunchConfig::new().with_window(
-            WindowConfig::new_app(SpeechApp { models_dir })
+        LaunchConfig::new()
+            .with_future(move |_| {
+                let mut scene = scene;
+                receiver.apply_all(move |command| scene.write().apply(command))
+            })
+            .with_window(
+                WindowConfig::new_app(SpeechApp {
+                    models_dir,
+                    scene,
+                    display,
+                    commands,
+                })
                 .with_size(900., 600.)
-                .with_title("Speech visualizer"),
-        ),
+                .with_title("Speech visualizer")
+                // Closing the main window quits, even while the display window is open.
+                .with_on_close(|mut ctx, _| {
+                    ctx.exit();
+                    CloseDecision::Close
+                }),
+            ),
     )
+}
+
+/// Follow the OS light/dark preference in the current window.
+fn use_os_theme() {
+    let mut theme = use_init_theme(|| Platform::get().preferred_theme.read().to_theme());
+    use_side_effect(move || theme.set(Platform::get().preferred_theme.read().to_theme()));
+}
+
+/// What the main window shows.
+#[derive(Clone, Copy, PartialEq)]
+enum Screen {
+    Selection,
+    Transcript,
+    Console,
 }
 
 /// What the user picked on the selection screen.
@@ -55,13 +94,14 @@ struct Options {
 
 struct SpeechApp {
     models_dir: PathBuf,
+    scene: State<Scene>,
+    display: State<Option<WindowId>>,
+    commands: SceneSender,
 }
 
 impl App for SpeechApp {
     fn render(&self) -> impl IntoElement {
-        // Follow the OS light/dark preference.
-        let mut theme = use_init_theme(|| Platform::get().preferred_theme.read().to_theme());
-        use_side_effect(move || theme.set(Platform::get().preferred_theme.read().to_theme()));
+        use_os_theme();
 
         // Kept here, so going back to the selection shows the last choices.
         let options = use_state(|| Options {
@@ -70,43 +110,49 @@ impl App for SpeechApp {
             language: LANGUAGES[0].0,
             pause_ms: PAUSE_DEFAULT_MS,
         });
-        let running = use_state(|| false);
+        let screen = use_state(|| Screen::Selection);
 
-        let screen = if running() {
-            Session {
-                options: options.read().clone(),
-                running,
-            }
-            .into_element()
-        } else {
-            Selection {
+        let content = match screen() {
+            Screen::Selection => Selection {
                 models_dir: self.models_dir.clone(),
                 options,
-                running,
+                screen,
             }
-            .into_element()
+            .into_element(),
+            Screen::Transcript => Session {
+                options: options.read().clone(),
+                screen,
+            }
+            .into_element(),
+            Screen::Console => Console {
+                screen,
+                scene: self.scene,
+                display: self.display,
+                commands: self.commands.clone(),
+            }
+            .into_element(),
         };
 
         rect()
             .expanded()
             .theme_background()
             .theme_color()
-            .child(screen)
+            .child(content)
     }
 }
 
-/// The options form; Start switches to a [`Session`].
+/// The options form; Start switches to a [`Session`], Open display to the [`Console`].
 #[derive(PartialEq)]
 struct Selection {
     models_dir: PathBuf,
     options: State<Options>,
-    running: State<bool>,
+    screen: State<Screen>,
 }
 
 impl Component for Selection {
     fn render(&self) -> impl IntoElement {
         let mut options = self.options;
-        let mut running = self.running;
+        let mut screen = self.screen;
 
         // Scanned on every visit, so models added in the meantime show up.
         let (models, vads, scan_error) = use_hook(|| match bin_files(&self.models_dir) {
@@ -192,15 +238,23 @@ impl Component for Selection {
             );
         }
 
-        rect().expanded().center().child(
-            form.child(
+        let buttons = rect()
+            .horizontal()
+            .spacing(8.)
+            .child(
                 Button::new()
                     .filled()
                     .enabled(can_start)
-                    .on_press(move |_| running.set(true))
+                    .on_press(move |_| screen.set(Screen::Transcript))
                     .child("Start"),
-            ),
-        )
+            )
+            .child(
+                Button::new()
+                    .on_press(move |_| screen.set(Screen::Console))
+                    .child("Open display without transcript"),
+            );
+
+        rect().expanded().center().child(form.child(buttons))
     }
 }
 
@@ -244,12 +298,12 @@ enum Status {
 #[derive(PartialEq)]
 struct Session {
     options: Options,
-    running: State<bool>,
+    screen: State<Screen>,
 }
 
 impl Component for Session {
     fn render(&self) -> impl IntoElement {
-        let mut running = self.running;
+        let mut screen = self.screen;
         let mut status = use_state(|| Status::Loading);
         let mut transcript = use_state(String::new);
         let mut live = use_state(String::new);
@@ -365,7 +419,7 @@ impl Component for Session {
             .background(colors.surface_primary)
             .child(
                 Button::new()
-                    .on_press(move |_| running.set(false))
+                    .on_press(move |_| screen.set(Screen::Selection))
                     .child("← Back to selection"),
             )
             .child(
@@ -403,7 +457,11 @@ impl Component for Session {
             .font_size(22.)
             .line_height(1.4)
             .span(Span::new(transcript.read().clone()))
-            .span(Span::new(format!("{sep}{}", live.read())).color(colors.text_secondary));
+            .span(
+                Span::new(format!("{sep}{}", live.read()))
+                    .color(colors.text_secondary)
+                    .font_slant(FontSlant::Italic),
+            );
 
         rect()
             .expanded()
@@ -422,6 +480,136 @@ impl Component for Session {
                     .width(Size::fill())
                     .height(Size::flex(1.))
                     .child(rect().padding(20.).child(text)),
+            )
+    }
+}
+
+/// Typed [`Command`]s for the display window, which opens with this screen and closes
+/// when going back to the selection. They go through a [`SceneSender`] like commands
+/// from any other thread.
+#[derive(PartialEq)]
+struct Console {
+    screen: State<Screen>,
+    scene: State<Scene>,
+    display: State<Option<WindowId>>,
+    commands: SceneSender,
+}
+
+impl Component for Console {
+    fn render(&self) -> impl IntoElement {
+        let (mut screen, scene, display) = (self.screen, self.scene, self.display);
+        let commands = self.commands.clone();
+        let mut input = use_state(String::new);
+        // Typed lines and what came of them (None while pending), oldest first.
+        let mut history = use_state(Vec::<(String, Option<Result<String, String>>)>::new);
+        let mut scroll = use_scroll_controller(|| ScrollConfig {
+            default_vertical_position: ScrollPosition::End,
+            ..Default::default()
+        });
+
+        use_hook(move || display::show(scene, display));
+
+        let on_submit = move |line: String| {
+            input.set(String::new());
+            scroll.scroll_to(ScrollPosition::End, Direction::Vertical);
+            let command = match Command::parse(&line) {
+                Ok(command) => command,
+                Err(err) => {
+                    history.write().push((line, Some(Err(err))));
+                    return;
+                }
+            };
+            let reply = commands.send(command);
+            let index = history.read().len();
+            history.write().push((line, None));
+            spawn(async move {
+                let outcome = match reply.await {
+                    Ok(Some(id)) => Ok(format!("added {id}")),
+                    Ok(None) => Ok("ok".into()),
+                    Err(err) => Err(err.to_string()),
+                };
+                history.write()[index].1 = Some(outcome);
+            });
+        };
+
+        let colors = use_theme().read().colors.clone();
+
+        let top_bar = rect()
+            .horizontal()
+            .width(Size::fill())
+            .padding(10.)
+            .spacing(12.)
+            .cross_align(Alignment::center())
+            .background(colors.surface_primary)
+            .child(
+                Button::new()
+                    .on_press(move |_| {
+                        display::close(display);
+                        screen.set(Screen::Selection);
+                    })
+                    .child("← Back to selection"),
+            )
+            .child(
+                Button::new()
+                    .on_press(move |_| display::show(scene, display))
+                    .child("Show display"),
+            )
+            .child(
+                label()
+                    .text("F11 in the display window toggles fullscreen")
+                    .color(colors.text_secondary),
+            );
+
+        let help = label()
+            .padding((8., 12.))
+            .font_size(13.)
+            .color(colors.text_secondary)
+            .text(
+                "rect [in <id>]  ·  text [in <id>] <text>  ·  set <id> <text>  ·  remove <id>  ·  clear",
+            );
+
+        let log =
+            rect()
+                .padding((0., 12.))
+                .spacing(4.)
+                .children(
+                    history
+                        .read()
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (line, outcome))| {
+                            let (result, color) = match outcome {
+                                None => ("…", colors.text_secondary),
+                                Some(Ok(message)) => (message.as_str(), colors.text_secondary),
+                                Some(Err(message)) => (message.as_str(), colors.error),
+                            };
+                            rect()
+                                .key(i)
+                                .child(label().text(format!("> {line}")).font_tabular())
+                                .child(label().text(result.to_owned()).color(color))
+                                .into_element()
+                        }),
+                );
+
+        rect()
+            .expanded()
+            .content(Content::Flex)
+            .child(top_bar)
+            .child(help)
+            .child(
+                ScrollView::new_controlled(scroll)
+                    .width(Size::fill())
+                    .height(Size::flex(1.))
+                    .child(log),
+            )
+            .child(
+                rect().width(Size::fill()).padding(12.).child(
+                    Input::new(input)
+                        .width(Size::fill())
+                        .placeholder("Type a command and press Enter")
+                        .auto_focus(true)
+                        .on_submit(on_submit),
+                ),
             )
     }
 }
