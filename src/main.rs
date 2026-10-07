@@ -26,6 +26,10 @@ const FORCE_CUT_SECS: u32 = 20;
 const CUT_TOLERANCE_MS: i64 = 200;
 // Whisper's limit: a section this long is finalized even without a pause or agreed cut.
 const MAX_SECTION_SECS: u32 = 30;
+// Whisper's language detection is slow and often wrong, so fix it to English for now.
+const LANG: Option<&str> = Some("en");
+// The VAD threshold: 0.0 = always speech, 1.0 = always silence.
+const VAD_THRESHOLD: f32 = 0.5;
 
 fn main() {
     let usage = "usage: just run <path/to/ggml-model.bin> <path/to/ggml-silero.bin>";
@@ -218,6 +222,7 @@ fn detect_speech(
     let samples = resample_linear(audio, rate, WHISPER_RATE);
     let mut params = WhisperVadParams::new();
     params.set_min_silence_duration(PAUSE_MS as i32);
+    params.set_threshold(VAD_THRESHOLD);
     let found: Vec<_> = vad.segments_from_samples(params, &samples)?.collect();
     let (Some(first), Some(last)) = (found.first(), found.last()) else {
         return Ok(None);
@@ -236,7 +241,7 @@ fn transcribe(state: &mut WhisperState, audio: &[f32], rate: u32) -> (Vec<Segmen
 
     // FullParams is consumed by full(), so build a fresh one per pass.
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_language(Some("en")); // "auto" = detect; e.g. "en" to fix it
+    params.set_language(LANG); // "auto" = detect; e.g. "en" to fix it
     // Every pass re-transcribes the section, so conditioning on earlier text would repeat it.
     params.set_no_context(true);
     params.set_single_segment(false); // segment ends are the candidate cut points

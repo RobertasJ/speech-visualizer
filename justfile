@@ -44,3 +44,10 @@ clean:
 # Bump nixpkgs in flake.lock
 update:
     nix flake update
+
+update-state:
+    @jj git fetch
+    @snapshot=$(jj log -r @ --no-graph -T 'commit_id'); \
+    jj rebase -r @ -d main; \
+    jj restore --from "$snapshot"
+
