@@ -43,6 +43,8 @@ fn main() {
     // Shared with the display window, which can be opened and closed independently.
     let scene = State::create_global(Scene::default());
     let display = State::create_global(None);
+    // The running transcriber, if any.
+    let transcriber = State::create_global(None);
     // Commands from every SceneSender (any thread) are applied here, on the UI thread.
     let (commands, receiver) = scene::channel();
 
@@ -57,12 +59,17 @@ fn main() {
                     models_dir,
                     scene,
                     display,
+                    transcriber,
                     commands,
                 })
                 .with_size(900., 600.)
                 .with_title("Speech visualizer")
                 // Closing the main window quits, even while the display window is open.
-                .with_on_close(|mut ctx, _| {
+                .with_on_close(move |mut ctx, _| {
+                    // Stop the transcriber and wait for its thread here: if the process
+                    // exits while whisper is still using the GPU, ggml aborts.
+                    let mut transcriber = transcriber;
+                    drop(transcriber.take());
                     ctx.exit();
                     CloseDecision::Close
                 }),
@@ -98,6 +105,7 @@ struct SpeechApp {
     models_dir: PathBuf,
     scene: State<Scene>,
     display: State<Option<WindowId>>,
+    transcriber: State<Option<Transcriber>>,
     commands: SceneSender,
 }
 
@@ -124,6 +132,7 @@ impl App for SpeechApp {
             Screen::Transcript => Session {
                 options: options.read().clone(),
                 screen,
+                transcriber: self.transcriber,
             }
             .into_element(),
             Screen::Console => Console {
@@ -138,6 +147,7 @@ impl App for SpeechApp {
                 screen,
                 scene: self.scene,
                 display: self.display,
+                transcriber: self.transcriber,
                 commands: self.commands.clone(),
             }
             .into_element(),
@@ -344,26 +354,39 @@ fn start_transcriber(
     rx
 }
 
-/// Waits for [`start_transcriber`] and shows how it went in `status`. The transcriber
-/// runs until the returned guard is dropped.
+/// Waits for [`start_transcriber`], shows how it went in `status` and keeps the
+/// transcriber in `running`. Returns whether it started.
 async fn wait_for_transcriber(
     setup: oneshot::Receiver<Result<Transcriber, stt::Error>>,
     mut status: State<Status>,
-) -> Option<StopInBackground> {
+    mut running: State<Option<Transcriber>>,
+) -> bool {
     match setup.await {
         Ok(Ok(transcriber)) => {
             status.set(Status::Listening(transcriber.device().clone()));
-            Some(StopInBackground(Some(transcriber)))
+            running.set(Some(transcriber));
+            true
         }
         Ok(Err(err)) => {
             status.set(Status::Failed(err.to_string()));
-            None
+            false
         }
         Err(_) => {
             status.set(Status::Failed("the setup thread panicked".into()));
-            None
+            false
         }
     }
+}
+
+/// Stops the transcriber in `running` when the calling component unmounts, on a
+/// separate thread: dropping it waits for the pass in progress, which would otherwise
+/// freeze the window.
+fn use_stop_in_background(mut running: State<Option<Transcriber>>) {
+    use_drop(move || {
+        if let Some(transcriber) = running.take() {
+            std::thread::spawn(move || drop(transcriber));
+        }
+    });
 }
 
 /// A running transcription. Its transcriber is started on mount and stopped when it
@@ -372,11 +395,13 @@ async fn wait_for_transcriber(
 struct Session {
     options: Options,
     screen: State<Screen>,
+    transcriber: State<Option<Transcriber>>,
 }
 
 impl Component for Session {
     fn render(&self) -> impl IntoElement {
         let mut screen = self.screen;
+        let transcriber = self.transcriber;
         let mut status = use_state(|| Status::Loading);
         let mut transcript = use_state(String::new);
         let mut live = use_state(String::new);
@@ -391,18 +416,19 @@ impl Component for Session {
             ..Default::default()
         });
 
+        use_stop_in_background(transcriber);
         use_hook(|| {
             let (event_tx, mut event_rx) = mpsc::unbounded();
             let setup = start_transcriber(&self.options, move |event| {
                 let _ = event_tx.unbounded_send(event);
             });
 
-            // Cancelled when the session unmounts, which drops the transcriber.
+            // Cancelled when the session unmounts.
             let arrived = arrived.clone();
             spawn(async move {
-                let Some(_transcriber) = wait_for_transcriber(setup, status).await else {
+                if !wait_for_transcriber(setup, status, transcriber).await {
                     return;
-                };
+                }
 
                 // The event channel closes when the transcription thread ends.
                 while let Some(event) = event_rx.next().await {
@@ -534,22 +560,23 @@ struct LiveSession {
     screen: State<Screen>,
     scene: State<Scene>,
     display: State<Option<WindowId>>,
+    transcriber: State<Option<Transcriber>>,
     commands: SceneSender,
 }
 
 impl Component for LiveSession {
     fn render(&self) -> impl IntoElement {
         let (mut screen, scene, display) = (self.screen, self.scene, self.display);
+        let transcriber = self.transcriber;
         let status = use_state(|| Status::Loading);
 
+        use_stop_in_background(transcriber);
         use_hook(|| {
             display::show(scene, display);
             let setup = start_transcriber(&self.options, live::spawn(self.commands.clone()));
-            // Cancelled when this screen unmounts, which drops the transcriber.
+            // Cancelled when this screen unmounts.
             spawn(async move {
-                if let Some(_transcriber) = wait_for_transcriber(setup, status).await {
-                    std::future::pending::<()>().await;
-                }
+                wait_for_transcriber(setup, status, transcriber).await;
             });
         });
 
@@ -854,18 +881,6 @@ fn average(window: &VecDeque<u32>) -> u32 {
 
 fn ms_f64(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.
-}
-
-/// Owns the transcriber and drops it on a separate thread: dropping waits for the pass in
-/// progress, which would otherwise freeze the window.
-struct StopInBackground(Option<Transcriber>);
-
-impl Drop for StopInBackground {
-    fn drop(&mut self) {
-        if let Some(transcriber) = self.0.take() {
-            std::thread::spawn(move || drop(transcriber));
-        }
-    }
 }
 
 /// The .bin files in `dir`, sorted by name.
