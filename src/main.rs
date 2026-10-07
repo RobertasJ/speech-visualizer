@@ -1,4 +1,5 @@
 mod display;
+mod live;
 mod scene;
 mod stt;
 
@@ -13,7 +14,7 @@ use freya::winit::window::WindowId;
 use futures_channel::{mpsc, oneshot};
 use futures_lite::StreamExt;
 
-use scene::{Command, Scene, SceneSender};
+use scene::{Command, ElementId, Scene, SceneSender};
 use stt::{Config, DeviceInfo, Event, Timing, Transcriber};
 
 /// Language codes offered in the selection, with "auto" for whisper's detection.
@@ -81,6 +82,7 @@ enum Screen {
     Selection,
     Transcript,
     Console,
+    Live,
 }
 
 /// What the user picked on the selection screen.
@@ -125,6 +127,14 @@ impl App for SpeechApp {
             }
             .into_element(),
             Screen::Console => Console {
+                screen,
+                scene: self.scene,
+                display: self.display,
+                commands: self.commands.clone(),
+            }
+            .into_element(),
+            Screen::Live => LiveSession {
+                options: options.read().clone(),
                 screen,
                 scene: self.scene,
                 display: self.display,
@@ -250,6 +260,12 @@ impl Component for Selection {
             )
             .child(
                 Button::new()
+                    .enabled(can_start)
+                    .on_press(move |_| screen.set(Screen::Live))
+                    .child("Live"),
+            )
+            .child(
+                Button::new()
                     .on_press(move |_| screen.set(Screen::Console))
                     .child("Open display without transcript"),
             );
@@ -293,6 +309,63 @@ enum Status {
     Failed(String),
 }
 
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Status::Loading => write!(f, "Loading models…"),
+            Status::Listening(device) => write!(
+                f,
+                "Recording from '{}' at {} Hz, {} channel(s)",
+                device.name, device.sample_rate, device.channels
+            ),
+            Status::Stopped => write!(f, "Stopped"),
+            Status::Failed(err) => write!(f, "Failed to start: {err}"),
+        }
+    }
+}
+
+/// Starts a transcriber with `options`. start() blocks while the models load, so it
+/// runs on its own thread; if the receiver is gone by the time it's done, the
+/// transcriber is dropped right there.
+fn start_transcriber(
+    options: &Options,
+    on_event: impl FnMut(Event) + Send + 'static,
+) -> oneshot::Receiver<Result<Transcriber, stt::Error>> {
+    let config = Config {
+        model_path: options.model.clone().unwrap_or_default(),
+        vad_path: options.vad.clone().unwrap_or_default(),
+        language: (options.language != "auto").then(|| options.language.to_owned()),
+        pause_ms: options.pause_ms,
+    };
+    let (tx, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(Transcriber::start(config, on_event));
+    });
+    rx
+}
+
+/// Waits for [`start_transcriber`] and shows how it went in `status`. The transcriber
+/// runs until the returned guard is dropped.
+async fn wait_for_transcriber(
+    setup: oneshot::Receiver<Result<Transcriber, stt::Error>>,
+    mut status: State<Status>,
+) -> Option<StopInBackground> {
+    match setup.await {
+        Ok(Ok(transcriber)) => {
+            status.set(Status::Listening(transcriber.device().clone()));
+            Some(StopInBackground(Some(transcriber)))
+        }
+        Ok(Err(err)) => {
+            status.set(Status::Failed(err.to_string()));
+            None
+        }
+        Err(_) => {
+            status.set(Status::Failed("the setup thread panicked".into()));
+            None
+        }
+    }
+}
+
 /// A running transcription. Its transcriber is started on mount and stopped when it
 /// unmounts, i.e. when going back to the selection.
 #[derive(PartialEq)]
@@ -319,41 +392,17 @@ impl Component for Session {
         });
 
         use_hook(|| {
-            let options = &self.options;
-            let config = Config {
-                model_path: options.model.clone().unwrap_or_default(),
-                vad_path: options.vad.clone().unwrap_or_default(),
-                language: (options.language != "auto").then(|| options.language.to_owned()),
-                pause_ms: options.pause_ms,
-            };
-
-            // start() blocks while the models load, so it runs on its own thread. If the
-            // session is gone by the time it's done, the transcriber is dropped right there.
-            let (setup_tx, setup_rx) = oneshot::channel();
             let (event_tx, mut event_rx) = mpsc::unbounded();
-            std::thread::spawn(move || {
-                let started = Transcriber::start(config, move |event| {
-                    let _ = event_tx.unbounded_send(event);
-                });
-                let _ = setup_tx.send(started);
+            let setup = start_transcriber(&self.options, move |event| {
+                let _ = event_tx.unbounded_send(event);
             });
 
             // Cancelled when the session unmounts, which drops the transcriber.
             let arrived = arrived.clone();
             spawn(async move {
-                let transcriber = match setup_rx.await {
-                    Ok(Ok(transcriber)) => transcriber,
-                    Ok(Err(err)) => {
-                        status.set(Status::Failed(err.to_string()));
-                        return;
-                    }
-                    Err(_) => {
-                        status.set(Status::Failed("the setup thread panicked".into()));
-                        return;
-                    }
+                let Some(_transcriber) = wait_for_transcriber(setup, status).await else {
+                    return;
                 };
-                status.set(Status::Listening(transcriber.device().clone()));
-                let _transcriber = StopInBackground(Some(transcriber));
 
                 // The event channel closes when the transcription thread ends.
                 while let Some(event) = event_rx.next().await {
@@ -400,15 +449,7 @@ impl Component for Session {
 
         let colors = use_theme().read().colors.clone();
 
-        let status_text = match &*status.read() {
-            Status::Loading => "Loading models…".to_owned(),
-            Status::Listening(device) => format!(
-                "Recording from '{}' at {} Hz, {} channel(s)",
-                device.name, device.sample_rate, device.channels
-            ),
-            Status::Stopped => "Stopped".to_owned(),
-            Status::Failed(err) => format!("Failed to start: {err}"),
-        };
+        let status_text = status.read().to_string();
 
         let top_bar = rect()
             .horizontal()
@@ -484,6 +525,116 @@ impl Component for Session {
     }
 }
 
+/// Live mode: transcribes like a [`Session`] and hands the events to [`live`], which
+/// drives the display window. The window opens with this screen and closes when going
+/// back to the selection.
+#[derive(PartialEq)]
+struct LiveSession {
+    options: Options,
+    screen: State<Screen>,
+    scene: State<Scene>,
+    display: State<Option<WindowId>>,
+    commands: SceneSender,
+}
+
+impl Component for LiveSession {
+    fn render(&self) -> impl IntoElement {
+        let (mut screen, scene, display) = (self.screen, self.scene, self.display);
+        let status = use_state(|| Status::Loading);
+
+        use_hook(|| {
+            display::show(scene, display);
+            let setup = start_transcriber(&self.options, live::spawn(self.commands.clone()));
+            // Cancelled when this screen unmounts, which drops the transcriber.
+            spawn(async move {
+                if let Some(_transcriber) = wait_for_transcriber(setup, status).await {
+                    std::future::pending::<()>().await;
+                }
+            });
+        });
+
+        let colors = use_theme().read().colors.clone();
+
+        let top_bar = rect()
+            .horizontal()
+            .width(Size::fill())
+            .padding(10.)
+            .spacing(12.)
+            .cross_align(Alignment::center())
+            .background(colors.surface_primary)
+            .child(
+                Button::new()
+                    .on_press(move |_| {
+                        display::close(display);
+                        screen.set(Screen::Selection);
+                    })
+                    .child("← Back to selection"),
+            )
+            .child(
+                Button::new()
+                    .on_press(move |_| display::show(scene, display))
+                    .child("Show display"),
+            )
+            .child(
+                label()
+                    .width(Size::flex(1.))
+                    .max_lines(1)
+                    .text_overflow(TextOverflow::Ellipsis)
+                    .text(status.read().to_string())
+                    .color(colors.text_secondary),
+            );
+
+        let rows = outline(&scene.read());
+        let body = if rows.is_empty() {
+            rect().padding(16.).child(
+                label()
+                    .text("No elements yet. Try saying \"rectangle\", then \"text in one hello\".")
+                    .color(colors.text_secondary),
+            )
+        } else {
+            rect().padding(16.).spacing(4.).children(rows)
+        };
+
+        rect()
+            .expanded()
+            .content(Content::Flex)
+            .child(top_bar)
+            .child(
+                ScrollView::new()
+                    .width(Size::fill())
+                    .height(Size::flex(1.))
+                    .child(body),
+            )
+    }
+}
+
+/// One row per element of `scene`, depth first, with its id and contents indented
+/// under each rect.
+fn outline(scene: &Scene) -> Vec<Element> {
+    let mut rows = Vec::new();
+    let mut pending: Vec<(ElementId, usize)> =
+        scene.roots().iter().rev().map(|&id| (id, 0)).collect();
+    while let Some((id, depth)) = pending.pop() {
+        let description = match scene.get(id) {
+            Some(scene::Element::Rect { children }) => {
+                pending.extend(children.iter().rev().map(|&child| (child, depth + 1)));
+                "rect".to_owned()
+            }
+            Some(scene::Element::Text { text }) => format!("text \"{text}\""),
+            None => continue,
+        };
+        rows.push(
+            label()
+                .key(id)
+                .padding((0., 0., 0., depth as f32 * 24.))
+                .font_size(18.)
+                .text(format!("{id}  {description}"))
+                .into(),
+        );
+    }
+    rows
+}
+
 /// Typed [`Command`]s for the display window, which opens with this screen and closes
 /// when going back to the selection. They go through a [`SceneSender`] like commands
 /// from any other thread.
@@ -519,7 +670,7 @@ impl Component for Console {
                     return;
                 }
             };
-            let reply = commands.send(command);
+            let reply = commands.request(command);
             let index = history.read().len();
             history.write().push((line, None));
             spawn(async move {
@@ -565,7 +716,7 @@ impl Component for Console {
             .font_size(13.)
             .color(colors.text_secondary)
             .text(
-                "rect [in <id>]  ·  text [in <id>] <text>  ·  set <id> <text>  ·  remove <id>  ·  clear",
+                "rect(angle) [in <id>]  ·  text [in <id>] <text>  ·  set <id> <text>  ·  remove <id>  ·  clear",
             );
 
         let log =

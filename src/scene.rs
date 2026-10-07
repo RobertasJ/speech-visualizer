@@ -169,7 +169,7 @@ impl Command {
     /// Parses a typed command:
     ///
     /// ```text
-    /// rect [in <id>]
+    /// rect [in <id>]        (or rectangle)
     /// text [in <id>] <text>
     /// set <id> <text>
     /// remove <id>
@@ -178,7 +178,7 @@ impl Command {
     pub fn parse(line: &str) -> Result<Self, String> {
         let (word, rest) = split_word(line);
         let command = match word {
-            "rect" => {
+            "rect" | "rectangle" => {
                 let (parent, rest) = parse_parent(rest)?;
                 expect_end(rest)?;
                 Command::AddRect { parent }
@@ -234,8 +234,13 @@ pub struct SceneSender {
 }
 
 impl SceneSender {
-    /// Queues `command`. Drop the [`Reply`] if you don't need the result.
-    pub fn send(&self, command: Command) -> Reply {
+    /// Queues `command`, without a way to find out how it went.
+    pub fn send(&self, command: Command) {
+        drop(self.request(command));
+    }
+
+    /// Queues `command`; the [`Reply`] gives its result once it has been applied.
+    pub fn request(&self, command: Command) -> Reply {
         let (reply_tx, reply_rx) = oneshot::channel();
         // If nothing applies commands anymore, `reply_tx` is dropped here and the
         // reply comes back as Closed.
@@ -258,10 +263,6 @@ pub struct Reply(oneshot::Receiver<CommandResult>);
 
 impl Reply {
     /// Blocks until the command has been applied.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "for worker threads; only the tests wait so far")
-    )]
     pub fn wait(self) -> CommandResult {
         futures_lite::future::block_on(self)
     }
@@ -306,11 +307,22 @@ fn parse_parent(text: &str) -> Result<(Option<ElementId>, &str), String> {
     }
 }
 
+/// An id in digits, or spelled out from one to ten (speech often comes out that way),
+/// optionally after "number": "3", "three", "number 3" and "number three" all work.
 fn parse_id(text: &str) -> Result<(ElementId, &str), String> {
-    let (word, rest) = split_word(text);
-    let id = word
-        .parse()
-        .map_err(|_| format!("expected an element id, got '{word}'"))?;
+    const WORDS: [&str; 10] = [
+        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    ];
+    let (mut word, mut rest) = split_word(text);
+    if word == "number" {
+        (word, rest) = split_word(rest);
+    }
+    let id = match WORDS.iter().position(|&w| w == word) {
+        Some(index) => index as u64 + 1,
+        None => word
+            .parse()
+            .map_err(|_| format!("expected an element id, got '{word}'"))?,
+    };
     Ok((ElementId(id), rest))
 }
 
@@ -383,12 +395,12 @@ mod tests {
     fn sender_works_from_another_thread() {
         let (sender, receiver) = channel();
         let worker = std::thread::spawn(move || {
-            let rect = sender.send(Command::AddRect { parent: None }).wait();
+            let rect = sender.request(Command::AddRect { parent: None }).wait();
             let text = Command::AddText {
                 parent: rect.clone().ok().flatten(),
                 text: "hi".into(),
             };
-            (rect, sender.send(text).wait())
+            (rect, sender.request(text).wait())
         });
 
         let mut scene = Scene::default();
@@ -408,9 +420,51 @@ mod tests {
         let (sender, receiver) = channel();
         drop(receiver);
         assert_eq!(
-            sender.send(Command::Clear).wait(),
+            sender.request(Command::Clear).wait(),
             Err(CommandError::Closed)
         );
+    }
+
+    #[test]
+    fn rectangle_is_rect() {
+        assert_eq!(
+            Command::parse("rectangle in 2"),
+            Ok(Command::AddRect {
+                parent: Some(ElementId(2))
+            })
+        );
+    }
+
+    #[test]
+    fn ids_can_be_spelled_out() {
+        assert_eq!(
+            Command::parse("text in three hi"),
+            Ok(Command::AddText {
+                parent: Some(ElementId(3)),
+                text: "hi".into()
+            })
+        );
+        assert_eq!(
+            Command::parse("remove ten"),
+            Ok(Command::Remove { id: ElementId(10) })
+        );
+        assert!(Command::parse("remove eleven").is_err());
+    }
+
+    #[test]
+    fn ids_can_follow_number() {
+        assert_eq!(
+            Command::parse("text in number two hi"),
+            Ok(Command::AddText {
+                parent: Some(ElementId(2)),
+                text: "hi".into()
+            })
+        );
+        assert_eq!(
+            Command::parse("remove number 4"),
+            Ok(Command::Remove { id: ElementId(4) })
+        );
+        assert!(Command::parse("remove number").is_err());
     }
 
     #[test]
