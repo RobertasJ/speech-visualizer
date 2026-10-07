@@ -1,2 +1,0 @@
-cargo run --release --features cuda -- 
-   Compiling whisper-rs-sys v0.15.0

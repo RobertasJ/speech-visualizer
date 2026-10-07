@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = [] # CPU; enable `cuda` or `vulkan` for GPU
+default = []                   # CPU; enable `cuda` or `vulkan` for GPU
 cuda = ["whisper-rs/cuda"]
 vulkan = ["whisper-rs/vulkan"]
 
@@ -16,8 +16,7 @@ futures-lite = "2.6.1"
 thiserror = "2.0.21"
 whisper-rs = "0.16"
 
-# Dev builds everywhere except whisper.cpp, which is unusably slow unoptimized. Turning
-# off debug assertions makes whisper-rs-sys's build script pick CMake's Release build.
+# Dev builds everywhere except whisper.cpp
 [profile.dev.package.whisper-rs-sys]
 opt-level = 3
 debug = false

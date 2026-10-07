@@ -48,7 +48,9 @@
           CMAKE_CUDA_ARCHITECTURES = "86";
           VULKAN_SDK = pkgs.vulkan-loader;
           # whisper-rs-sys only searches /usr/local/cuda and /opt/cuda for link libs.
-          RUSTFLAGS = "-L ${cuda}/lib -L ${cuda}/lib/stubs";
+          # rustup >= 1.90 links with its bundled rust-lld, which bypasses Nix's ld wrapper
+          # (and the NIX_LDFLAGS -L paths for buildInputs); -lld goes back to the system cc/ld.
+          RUSTFLAGS = "-L ${cuda}/lib -L ${cuda}/lib/stubs -C linker-features=-lld";
           # Real libcuda.so comes from the NixOS driver at runtime.
           LD_LIBRARY_PATH = "/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath freyaLibraries}";
         };
