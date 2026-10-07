@@ -635,8 +635,8 @@ impl Component for LiveSession {
     }
 }
 
-/// One row per element of `scene`, depth first, with its id and contents indented
-/// under each rect.
+/// One row per element of `scene`, depth first, with its id, names and contents
+/// indented under each rect.
 fn outline(scene: &Scene) -> Vec<Element> {
     let mut rows = Vec::new();
     let mut pending: Vec<(ElementId, usize)> =
@@ -650,12 +650,18 @@ fn outline(scene: &Scene) -> Vec<Element> {
             Some(scene::Element::Text { text }) => format!("text \"{text}\""),
             None => continue,
         };
+        let names = scene.names_of(id);
+        let heading = if names.is_empty() {
+            id.to_string()
+        } else {
+            format!("{id} ({})", names.join(", "))
+        };
         rows.push(
             label()
                 .key(id)
                 .padding((0., 0., 0., depth as f32 * 24.))
                 .font_size(18.)
-                .text(format!("{id}  {description}"))
+                .text(format!("{heading}  {description}"))
                 .into(),
         );
     }
@@ -743,7 +749,7 @@ impl Component for Console {
             .font_size(13.)
             .color(colors.text_secondary)
             .text(
-                "rect(angle) [in <id>]  ·  text [in <id>] <text>  ·  set <id> <text>  ·  remove <id>  ·  clear",
+                "rect(angle) [in <id>]  ·  text [in <id>] <text>  ·  set <id> <text>  ·  remove <id>  ·  name <id> <name>  ·  unname <name>  ·  unname all  ·  clear  —  a name works wherever an <id> does",
             );
 
         let log =
