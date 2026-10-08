@@ -1,39 +1,34 @@
-//! Live mode: turns what's being said into commands for the display window's scene.
+use freya::prelude::State;
+use futures_channel::mpsc;
+use futures_lite::StreamExt;
 
-use std::sync::mpsc;
-use std::thread;
-
-use crate::scene::{Command, SceneSender};
+use crate::command::Command;
+use crate::names::Names;
+use crate::scene::Scene;
 use crate::stt::Event;
 
-/// Starts the live logic on its own thread, so it can take its time (and wait for
-/// replies to its commands) without holding up transcription or the UI. Returns the
-/// callback to hand the transcriber; the thread ends once that's dropped.
-pub fn spawn(scene: SceneSender) -> impl FnMut(Event) + Send + 'static {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut live = Live::new(scene);
-        for event in rx {
+/// Starts the live logic as a task of the calling component, on the UI thread where
+/// the scene can be changed; it stops when the component unmounts. Returns the
+/// callback to hand the transcriber, which may call it from any thread.
+pub fn spawn(scene: State<Scene>, names: State<Names>) -> impl FnMut(Event) + Send + 'static {
+    let (tx, mut rx) = mpsc::unbounded();
+    freya::prelude::spawn(async move {
+        let mut live = Live { scene, names };
+        while let Some(event) = rx.next().await {
             live.on_event(event);
         }
     });
     move |event| {
-        let _ = tx.send(event);
+        let _ = tx.unbounded_send(event);
     }
 }
 
-/// What the live logic keeps between events.
 struct Live {
-    scene: SceneSender,
+    scene: State<Scene>,
+    names: State<Names>,
 }
 
 impl Live {
-    fn new(scene: SceneSender) -> Self {
-        // Start from an empty display.
-        scene.send(Command::Clear);
-        Self { scene }
-    }
-
     /// Called for every transcription event, in order: work out what the display should
     /// show and send commands for it.
     fn on_event(&mut self, event: Event) {
@@ -46,14 +41,14 @@ impl Live {
                 if line.is_empty() {
                     return;
                 }
-                let command = match Command::parse(&line) {
+                let command = match line.parse::<Command>() {
                     Ok(command) => command,
                     Err(err) => {
                         eprintln!("[live] '{line}': {err}");
                         return;
                     }
                 };
-                if let Err(err) = self.scene.request(command).wait() {
+                if let Err(err) = command.apply(&mut self.scene.write(), &mut self.names.write()) {
                     eprintln!("[live] '{line}': {err}");
                 }
             }
@@ -71,14 +66,5 @@ fn normalize(text: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_drops_punctuation_and_case() {
-        assert_eq!(
-            normalize(" Text in 3, Hello World."),
-            " text in 3 hello world"
-        );
-    }
-}
+#[path = "live_tests.rs"]
+mod tests;

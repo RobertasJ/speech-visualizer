@@ -1,6 +1,3 @@
-//! Live transcription of the default input device: sections of speech cut at pauses,
-//! re-transcribed on a worker thread until final.
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -69,34 +66,26 @@ pub enum Event {
     Error(String),
 }
 
-/// Where the time went in the loop iteration that produced an event, for diagnostics.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
     /// Time spent waiting for audio before the iteration. Near 0 means the worker is
     /// busy all the time and falls behind.
     pub wait_ms: u32,
-    /// Audio that arrived since the previous iteration.
     pub new_audio_ms: u32,
-    /// The VAD call.
     pub vad_ms: u32,
-    /// Audio the pass transcribed.
     pub audio_ms: u32,
     /// When the event was sent, to measure how long it takes to arrive.
     pub sent_at: Instant,
 }
 
-/// Why a section's text became final.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum End {
-    /// The speech paused for at least pause_ms.
     Pause,
     /// A long section was cut at a segment end two passes agreed on.
     Cut,
-    /// The section reached MAX_SECTION_SECS without a pause or agreed cut.
     MaxLength,
 }
 
-/// Why a Transcriber couldn't start.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("failed to load model: {0}")]
@@ -117,7 +106,6 @@ pub enum Error {
     PlayStream(cpal::Error),
 }
 
-/// The input device being recorded, at its native rate.
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
     pub name: String,
@@ -183,7 +171,6 @@ impl Transcriber {
         &self.device
     }
 
-    /// Changes how long a silence ends a section, from the next loop on.
     #[expect(dead_code, reason = "the GUI sets the pause length before starting")]
     pub fn set_pause_ms(&self, ms: u32) {
         self.pause_ms.store(ms, Ordering::Relaxed);
@@ -199,7 +186,6 @@ impl Drop for Transcriber {
     }
 }
 
-/// What the stream's callbacks send to the worker.
 enum Input {
     /// Mono audio at the device rate.
     Audio(Vec<f32>),
@@ -207,7 +193,6 @@ enum Input {
     Error(cpal::Error),
 }
 
-/// Everything the worker thread owns once setup succeeded.
 struct Worker {
     state: WhisperState,
     vad: WhisperVadContext,
@@ -280,7 +265,6 @@ impl Worker {
         Ok((worker, info))
     }
 
-    /// Transcribes until `stop` is set, or returns the error that stopped it.
     fn run(
         mut self,
         pause_ms: &AtomicU32,
@@ -310,7 +294,6 @@ impl Worker {
         let mut prev: Vec<Segment> = Vec::new();
         // Text of the last Live event, so unchanged passes aren't reported again.
         let mut live = String::new();
-        // Audio that arrived, and time spent in recv, since the last VAD run.
         let mut new_samples = 0;
         let mut waited = Duration::ZERO;
 
