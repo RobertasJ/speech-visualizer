@@ -7,26 +7,20 @@ use futures_channel::mpsc;
 use futures_lite::StreamExt;
 
 use super::diagnostics::{Diagnostics, ms_f64};
-use super::transcriber::{Status, start_transcriber, use_stop_in_background, wait_for_transcriber};
-use crate::Screen;
+use super::nav_back::NavBack;
+use super::transcriber::use_transcriber;
 use crate::options::Options;
-use crate::stt::{Event, Transcriber};
+use crate::stt::Event;
 
 #[derive(PartialEq)]
-pub struct Session {
-    pub options: Options,
-    pub screen: State<Screen>,
-    pub transcriber: State<Option<Transcriber>>,
-}
+pub struct Session;
 
 impl Component for Session {
     fn render(&self) -> impl IntoElement {
-        let mut screen = self.screen;
-        let transcriber = self.transcriber;
-        let mut status = use_state(|| Status::Loading);
+        let options = GlobalContexts::get().get_context::<State<Options>>();
         let mut transcript = use_state(String::new);
         let mut live = use_state(String::new);
-        let mut diagnostics = use_state(|| Diagnostics::new(self.options.diag_window));
+        let mut diagnostics = use_state(|| Diagnostics::new(options.peek().diag_window));
         // When the latest update arrived, until the render that shows it takes it.
         let arrived = use_hook(|| Rc::new(Cell::new(None::<Instant>)));
         let render_lag = use_hook(|| Rc::new(Cell::new(None::<Duration>)));
@@ -36,21 +30,12 @@ impl Component for Session {
             ..Default::default()
         });
 
-        use_stop_in_background(transcriber);
-        use_hook(|| {
+        let status = use_transcriber(|| {
             let (event_tx, mut event_rx) = mpsc::unbounded();
-            let setup = start_transcriber(&self.options, move |event| {
-                let _ = event_tx.unbounded_send(event);
-            });
 
             // Cancelled when the session unmounts.
             let arrived = arrived.clone();
             spawn(async move {
-                if !wait_for_transcriber(setup, status, transcriber).await {
-                    return;
-                }
-
-                // The event channel closes when the transcription thread ends.
                 while let Some(event) = event_rx.next().await {
                     match event {
                         Event::Live {
@@ -83,8 +68,11 @@ impl Component for Session {
                     }
                     scroll.scroll_to(ScrollPosition::End, Direction::Vertical);
                 }
-                status.set(Status::Stopped);
             });
+
+            move |event| {
+                let _ = event_tx.unbounded_send(event);
+            }
         });
 
         if let Some(at) = arrived.take() {
@@ -104,11 +92,7 @@ impl Component for Session {
             .spacing(12.)
             .cross_align(Alignment::center())
             .background(colors.surface_primary)
-            .child(
-                Button::new()
-                    .on_press(move |_| screen.set(Screen::Selection))
-                    .child("← Back to selection"),
-            )
+            .child(NavBack)
             .child(
                 label()
                     .width(Size::flex(1.))

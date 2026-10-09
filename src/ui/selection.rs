@@ -6,15 +6,12 @@ use crate::Screen;
 use crate::options::Options;
 
 #[derive(PartialEq)]
-pub struct Selection {
-    pub options: State<Options>,
-    pub screen: State<Screen>,
-}
+pub struct Selection;
 
 impl Component for Selection {
     fn render(&self) -> impl IntoElement {
-        let mut options = self.options;
-        let mut screen = self.screen;
+        let mut options = GlobalContexts::get().get_context::<State<Options>>();
+        let mut screen = use_consume::<State<Screen>>();
 
         // Scanned on every visit, so models added in the meantime show up.
         let (models, vads, scan_error) = use_hook(|| {

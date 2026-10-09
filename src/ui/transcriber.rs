@@ -26,10 +26,50 @@ impl std::fmt::Display for Status {
     }
 }
 
+/// Starts a transcriber owned by the calling component, with the options at the time,
+/// and hands its events to the callback `on_event` makes. It's stopped when the
+/// component unmounts, waiting for the pass in progress: if the process exits while
+/// whisper is still using the GPU, ggml aborts.
+pub fn use_transcriber<F>(on_event: impl FnOnce() -> F) -> State<Status>
+where
+    F: FnMut(Event) + Send + 'static,
+{
+    let mut status = use_state(|| Status::Loading);
+    let mut running = use_state(|| None::<Transcriber>);
+
+    use_drop(move || drop(running.take()));
+    use_hook(|| {
+        let options = GlobalContexts::get().get_context::<State<Options>>();
+        // Dropped along with the callback, when the transcription thread ends.
+        let (ended_tx, ended_rx) = oneshot::channel::<()>();
+        let mut on_event = on_event();
+        let setup = start_transcriber(&options.peek(), move |event| {
+            let _ = &ended_tx;
+            on_event(event);
+        });
+
+        // Cancelled when the component unmounts.
+        spawn(async move {
+            match setup.await {
+                Ok(Ok(transcriber)) => {
+                    status.set(Status::Listening(transcriber.device().clone()));
+                    running.set(Some(transcriber));
+                }
+                Ok(Err(err)) => return status.set(Status::Failed(err.to_string())),
+                Err(_) => return status.set(Status::Failed("the setup thread panicked".into())),
+            }
+            let _ = ended_rx.await;
+            status.set(Status::Stopped);
+        });
+    });
+
+    status
+}
+
 /// Starts a transcriber with `options`. start() blocks while the models load, so it
 /// runs on its own thread; if the receiver is gone by the time it's done, the
 /// transcriber is dropped right there.
-pub fn start_transcriber(
+fn start_transcriber(
     options: &Options,
     on_event: impl FnMut(Event) + Send + 'static,
 ) -> oneshot::Receiver<Result<Transcriber, stt::Error>> {
@@ -44,37 +84,4 @@ pub fn start_transcriber(
         let _ = tx.send(Transcriber::start(config, on_event));
     });
     rx
-}
-
-pub async fn wait_for_transcriber(
-    setup: oneshot::Receiver<Result<Transcriber, stt::Error>>,
-    mut status: State<Status>,
-    mut running: State<Option<Transcriber>>,
-) -> bool {
-    match setup.await {
-        Ok(Ok(transcriber)) => {
-            status.set(Status::Listening(transcriber.device().clone()));
-            running.set(Some(transcriber));
-            true
-        }
-        Ok(Err(err)) => {
-            status.set(Status::Failed(err.to_string()));
-            false
-        }
-        Err(_) => {
-            status.set(Status::Failed("the setup thread panicked".into()));
-            false
-        }
-    }
-}
-
-/// Stops the transcriber in `running` when the calling component unmounts, on a
-/// separate thread: dropping it waits for the pass in progress, which would otherwise
-/// freeze the window.
-pub fn use_stop_in_background(mut running: State<Option<Transcriber>>) {
-    use_drop(move || {
-        if let Some(transcriber) = running.take() {
-            std::thread::spawn(move || drop(transcriber));
-        }
-    });
 }

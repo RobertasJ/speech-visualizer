@@ -1,36 +1,19 @@
 use freya::prelude::*;
 
-use super::transcriber::{Status, start_transcriber, use_stop_in_background, wait_for_transcriber};
-use crate::Screen;
+use super::nav_back::NavBack;
+use super::transcriber::use_transcriber;
 use crate::live;
 use crate::names::Names;
-use crate::options::Options;
 use crate::scene::{self, ElementId, Scene, use_scene};
-use crate::stt::Transcriber;
 
 #[derive(PartialEq)]
-pub struct LiveSession {
-    pub options: Options,
-    pub screen: State<Screen>,
-    pub transcriber: State<Option<Transcriber>>,
-}
+pub struct LiveSession;
 
 impl Component for LiveSession {
     fn render(&self) -> impl IntoElement {
-        let mut screen = self.screen;
         let scene = use_scene();
         let names = use_state(Names::default);
-        let transcriber = self.transcriber;
-        let status = use_state(|| Status::Loading);
-
-        use_stop_in_background(transcriber);
-        use_hook(|| {
-            let setup = start_transcriber(&self.options, live::spawn(scene, names));
-            // Cancelled when this screen unmounts.
-            spawn(async move {
-                wait_for_transcriber(setup, status, transcriber).await;
-            });
-        });
+        let status = use_transcriber(|| live::spawn(scene, names));
 
         let colors = use_theme().read().colors.clone();
 
@@ -41,11 +24,7 @@ impl Component for LiveSession {
             .spacing(12.)
             .cross_align(Alignment::center())
             .background(colors.surface_primary)
-            .child(
-                Button::new()
-                    .on_press(move |_| screen.set(Screen::Selection))
-                    .child("← Back to selection"),
-            )
+            .child(NavBack)
             .child(
                 label()
                     .width(Size::flex(1.))

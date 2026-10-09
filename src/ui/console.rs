@@ -1,18 +1,15 @@
 use freya::prelude::*;
 
-use crate::Screen;
+use super::nav_back::NavBack;
 use crate::command::Command;
 use crate::names::Names;
 use crate::scene::use_scene;
 
 #[derive(PartialEq)]
-pub struct Console {
-    pub screen: State<Screen>,
-}
+pub struct Console;
 
 impl Component for Console {
     fn render(&self) -> impl IntoElement {
-        let mut screen = self.screen;
         let mut scene = use_scene();
         let mut names = use_state(Names::default);
         let mut input = use_state(String::new);
@@ -46,11 +43,7 @@ impl Component for Console {
             .spacing(12.)
             .cross_align(Alignment::center())
             .background(colors.surface_primary)
-            .child(
-                Button::new()
-                    .on_press(move |_| screen.set(Screen::Selection))
-                    .child("← Back to selection"),
-            )
+            .child(NavBack)
             .child(
                 label()
                     .text("F11 in the display window toggles fullscreen")
