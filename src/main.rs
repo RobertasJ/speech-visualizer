@@ -2,6 +2,7 @@ mod live;
 mod options;
 mod scene;
 mod stt;
+mod typesafeai;
 mod ui;
 
 use freya::prelude::*;
@@ -10,6 +11,8 @@ use options::Options;
 use ui::{Console, LiveSession, Selection, Session};
 
 fn main() {
+    dotenv::dotenv().ok();
+
     let mut options = Options::default();
     if let Some(dir) = std::env::args().nth(1) {
         options.models_dir = dir.into();

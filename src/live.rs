@@ -5,11 +5,20 @@ use crate::stt::Event;
 
 /// Turns transcription events into scene changes, on the UI thread.
 pub struct Live {
-    pub scene: State<Scene>,
-    pub names: State<Names>,
+    scene: State<Scene>,
+    names: State<Names>,
+    transcript: String,
 }
 
 impl Live {
+    pub fn new(scene: State<Scene>, names: State<Names>) -> Self {
+        Self {
+            scene,
+            names,
+            transcript: String::new(),
+        }
+    }
+
     /// Called for every transcription event, in order: work out what the display should
     /// show and send commands for it.
     pub fn on_event(&mut self, event: Event) {
@@ -18,43 +27,9 @@ impl Live {
             Event::Live { .. } => {}
             // Text that won't change anymore: run it as a command, like a typed one.
             Event::Final { text, .. } => {
-                let line = normalize(&text);
-                if line.is_empty() {
-                    return;
-                }
-                let command = match line.parse::<Command>() {
-                    Ok(command) => command,
-                    Err(err) => {
-                        eprintln!("[live] '{line}': {err}");
-                        return;
-                    }
-                };
-                if let Err(err) = command.apply(&mut self.scene.write(), &mut self.names.write()) {
-                    eprintln!("[live] '{line}': {err}");
-                }
+                self.transcript.push_str(&text);
             }
             Event::Started(_) | Event::Error(_) | Event::Failed(_) => {}
         }
-    }
-}
-
-/// Drops commas and periods and lowercases, so "Text, Hello." reads as "text hello".
-fn normalize(text: &str) -> String {
-    text.chars()
-        .filter(|c| !matches!(c, ',' | '.'))
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_drops_punctuation_and_case() {
-        assert_eq!(
-            normalize(" Text in 3, Hello World."),
-            " text in 3 hello world"
-        );
     }
 }

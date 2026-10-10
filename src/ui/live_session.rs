@@ -13,7 +13,7 @@ impl Component for LiveSession {
         let scene = use_scene();
         let names = use_state(Names::default);
         let mut status = use_state(|| Status::Loading);
-        let mut live = Live { scene, names };
+        let mut live = Live::new(scene, names);
         use_stt(move |event| match event {
             Event::Started(device) => status.set(Status::Listening(device)),
             Event::Failed(err) => status.set(Status::Failed(err)),
