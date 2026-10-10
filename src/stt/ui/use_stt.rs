@@ -25,6 +25,8 @@ pub fn use_stt(mut on_event: impl FnMut(Event) + 'static) {
     let (stop, thread) = use_hook(|| {
         let options = GlobalContexts::get().get_context::<State<Options>>();
         let config = config(&options.peek());
+
+        // The thread is stopped by setting `stop` to true, which the thread checks in a loop.
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, mut rx) = mpsc::unbounded();
 
@@ -50,8 +52,6 @@ pub fn use_stt(mut on_event: impl FnMut(Event) + 'static) {
         (stop, Rc::new(Cell::new(Some(thread))))
     });
 
-    // Joined, not detached: if the process exits while whisper is still using the GPU,
-    // ggml aborts.
     use_drop(move || {
         stop.store(true, Ordering::Relaxed);
         if let Some(thread) = thread.take() {

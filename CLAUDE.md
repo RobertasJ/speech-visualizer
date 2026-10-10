@@ -20,6 +20,9 @@ separate display window.
 - `stt.rs`: `run()` loads the models, captures audio with cpal, and does VAD and
   whisper passes until stopped, blocking. It emits `Event::Started`, then `Live` /
   `Final` / `Error` (stream errors, recording goes on), and returns an `Error` on failure.
+  - `stt/mic.rs`: `Mic::start()` records mono audio from the default input device with
+    cpal; `recv(timeout)` waits for it and returns everything queued. It stops when
+    dropped.
   - `stt/ui/`: the Freya side of it. `use_stt(on_event)` runs `run()` on a thread and
     calls `on_event` on the UI thread for each event, ending with `Event::Failed` if it
     errors. Also `Status` (for screens to show) and `Diagnostics`.

@@ -1,17 +1,17 @@
+mod mic;
 mod ui;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, SampleFormat, SizedSample};
+use mic::{Input, Mic};
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperError,
     WhisperState, WhisperVadContext, WhisperVadContextParams, WhisperVadParams,
 };
 
+pub use mic::DeviceInfo;
 pub use ui::*;
 
 const WHISPER_RATE: u32 = 16_000;
@@ -99,35 +99,10 @@ pub enum Error {
     CreateState(WhisperError),
     #[error("failed to load VAD model: {0}")]
     LoadVad(WhisperError),
-    #[error("no input device")]
-    NoInputDevice,
-    #[error("no default input config: {0}")]
-    NoDefaultConfig(cpal::Error),
-    #[error("unsupported sample format: {0:?}")]
-    UnsupportedSampleFormat(SampleFormat),
-    #[error("failed to build input stream: {0}")]
-    BuildStream(cpal::Error),
-    #[error("failed to start input stream: {0}")]
-    PlayStream(cpal::Error),
-    #[error("audio channel closed")]
-    AudioClosed,
+    #[error(transparent)]
+    Mic(#[from] mic::Error),
     #[error("transcription failed: {0}")]
     Transcribe(WhisperError),
-}
-
-#[derive(Debug, Clone)]
-pub struct DeviceInfo {
-    pub name: String,
-    pub sample_rate: u32,
-    pub channels: u16,
-}
-
-/// What the mic stream sends to [`run`].
-enum Input {
-    /// Mono audio at the device rate.
-    Audio(Vec<f32>),
-    /// An error from the stream; recording may go on.
-    Error(cpal::Error),
 }
 
 /// Loads the models, then records from the default input device and transcribes until
@@ -154,40 +129,10 @@ pub fn run(
     )
     .map_err(Error::LoadVad)?;
 
-    // --- Mic: default input device at its native rate/format ---
-    let host = cpal::default_host();
-    let device = host.default_input_device().ok_or(Error::NoInputDevice)?;
-    let supported = device
-        .default_input_config()
-        .map_err(Error::NoDefaultConfig)?;
-
-    let info = DeviceInfo {
-        name: device
-            .description()
-            .map(|d| d.name().to_owned())
-            .unwrap_or_default(),
-        sample_rate: supported.sample_rate(),
-        channels: supported.channels(),
-    };
-    let channels = supported.channels() as usize;
-    let sample_format = supported.sample_format();
-    let stream_config: cpal::StreamConfig = supported.into();
-
-    // The audio callback runs on cpal's thread and sends mono chunks here.
-    let (tx, rx) = mpsc::channel();
-
-    // Recording stops (and the mic is released) when this is dropped, on return.
-    let stream = match sample_format {
-        SampleFormat::F32 => build_stream::<f32>(&device, stream_config, channels, tx),
-        SampleFormat::I16 => build_stream::<i16>(&device, stream_config, channels, tx),
-        SampleFormat::U16 => build_stream::<u16>(&device, stream_config, channels, tx),
-        other => return Err(Error::UnsupportedSampleFormat(other)),
-    }
-    .map_err(Error::BuildStream)?;
-    stream.play().map_err(Error::PlayStream)?;
-
-    let rate = info.sample_rate;
-    on_event(Event::Started(info));
+    // --- Mic: recording stops (and the mic is released) when this is dropped, on return ---
+    let mic = Mic::start()?;
+    let rate = mic.info.sample_rate;
+    on_event(Event::Started(mic.info.clone()));
 
     // --- Main loop: sections of speech cut at pauses, re-transcribed until final ---
     let samples = |ms: u32| (rate as u64 * ms as u64 / 1000) as usize;
@@ -218,17 +163,12 @@ pub fn run(
         // Block until there's new audio, then take everything that queued up while
         // the previous pass was running so we always work on the latest audio.
         let recv_start = Instant::now();
-        let received = rx.recv_timeout(STOP_POLL);
+        let received = mic.recv(STOP_POLL)?;
         waited += recv_start.elapsed();
-        let first = match received {
-            Ok(input) => Some(input),
-            Err(RecvTimeoutError::Timeout) => None,
-            Err(RecvTimeoutError::Disconnected) => return Err(Error::AudioClosed),
-        };
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
-        for input in first.into_iter().chain(rx.try_iter()) {
+        for input in received {
             match input {
                 Input::Audio(chunk) => {
                     new_samples += chunk.len();
@@ -472,38 +412,6 @@ fn strip_annotations(text: &str) -> String {
         }
     }
     out.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Builds an input stream for sample type `T`, converts samples to f32,
-/// and downmixes interleaved channels to mono before sending them on.
-fn build_stream<T>(
-    device: &cpal::Device,
-    config: cpal::StreamConfig,
-    channels: usize,
-    tx: mpsc::Sender<Input>,
-) -> Result<cpal::Stream, cpal::Error>
-where
-    T: SizedSample,
-    f32: FromSample<T>,
-{
-    let err_tx = tx.clone();
-    device.build_input_stream(
-        config,
-        move |data: &[T], _: &cpal::InputCallbackInfo| {
-            // Interleaved: [L, R, L, R, ...] for stereo. Average each frame.
-            let mono: Vec<f32> = data
-                .chunks(channels)
-                .map(|frame| {
-                    frame.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / channels as f32
-                })
-                .collect();
-            let _ = tx.send(Input::Audio(mono));
-        },
-        move |err| {
-            let _ = err_tx.send(Input::Error(err));
-        },
-        None,
-    )
 }
 
 /// Simple linear-interpolation resampler (no low-pass filter, so a little
