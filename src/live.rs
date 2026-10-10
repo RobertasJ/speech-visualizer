@@ -1,11 +1,14 @@
 use freya::prelude::State;
 
-use crate::scene::{Command, Names, Scene};
+use crate::scene::{Names, Scene};
 use crate::stt::Event;
 
 /// Turns transcription events into scene changes, on the UI thread.
 pub struct Live {
+    // Will be used once commands are run from the transcript.
+    #[allow(dead_code)]
     scene: State<Scene>,
+    #[allow(dead_code)]
     names: State<Names>,
     transcript: String,
 }

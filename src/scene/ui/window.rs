@@ -56,6 +56,7 @@ pub fn spawn_window(config: WindowConfig) -> WindowHandle {
     WindowHandle { slot, platform }
 }
 
+#[allow(dead_code)]
 impl WindowHandle {
     /// False once it's closed, by [`close`](Self::close) or from outside.
     pub fn is_open(&self) -> bool {

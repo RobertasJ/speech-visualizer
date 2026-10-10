@@ -2,6 +2,8 @@ mod live;
 mod options;
 mod scene;
 mod stt;
+// Not wired into the app yet.
+#[allow(dead_code)]
 mod typesafeai;
 mod ui;
 
