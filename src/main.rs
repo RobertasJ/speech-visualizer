@@ -23,6 +23,14 @@ fn main() {
     // Kept for the whole run, so going back to the selection shows the last choices.
     let options = State::create_global(options);
 
+    // Freya runs its own executor; entering a Tokio runtime lets futures spawned in
+    // components use Tokio-based crates like reqwest. Kept alive until launch returns.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build the Tokio runtime");
+    let _rt = rt.enter();
+
     launch(
         // Global contexts are in the root context of every window.
         LaunchConfig::new().with_global(options).with_window(
