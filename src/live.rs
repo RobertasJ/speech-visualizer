@@ -1,35 +1,18 @@
 use freya::prelude::State;
-use futures_channel::mpsc;
-use futures_lite::StreamExt;
 
 use crate::scene::{Command, Names, Scene};
 use crate::stt::Event;
 
-/// Starts the live logic as a task of the calling component, on the UI thread where
-/// the scene can be changed; it stops when the component unmounts. Returns the
-/// callback to hand the transcriber, which may call it from any thread.
-pub fn spawn(scene: State<Scene>, names: State<Names>) -> impl FnMut(Event) + Send + 'static {
-    let (tx, mut rx) = mpsc::unbounded();
-    freya::prelude::spawn(async move {
-        let mut live = Live { scene, names };
-        while let Some(event) = rx.next().await {
-            live.on_event(event);
-        }
-    });
-    move |event| {
-        let _ = tx.unbounded_send(event);
-    }
-}
-
-struct Live {
-    scene: State<Scene>,
-    names: State<Names>,
+/// Turns transcription events into scene changes, on the UI thread.
+pub struct Live {
+    pub scene: State<Scene>,
+    pub names: State<Names>,
 }
 
 impl Live {
     /// Called for every transcription event, in order: work out what the display should
     /// show and send commands for it.
-    fn on_event(&mut self, event: Event) {
+    pub fn on_event(&mut self, event: Event) {
         match event {
             // The open section's text so far; it may still change.
             Event::Live { .. } => {}
@@ -50,7 +33,7 @@ impl Live {
                     eprintln!("[live] '{line}': {err}");
                 }
             }
-            Event::Error(_) => {}
+            Event::Started(_) | Event::Error(_) | Event::Failed(_) => {}
         }
     }
 }

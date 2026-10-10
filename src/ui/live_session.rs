@@ -1,9 +1,9 @@
 use freya::prelude::*;
 
 use super::nav_back::NavBack;
-use crate::live;
+use crate::live::Live;
 use crate::scene::{self, ElementId, Names, Scene, use_scene};
-use crate::stt::use_transcriber;
+use crate::stt::{Event, Status, use_stt};
 
 #[derive(PartialEq)]
 pub struct LiveSession;
@@ -12,7 +12,13 @@ impl Component for LiveSession {
     fn render(&self) -> impl IntoElement {
         let scene = use_scene();
         let names = use_state(Names::default);
-        let status = use_transcriber(|| live::spawn(scene, names));
+        let mut status = use_state(|| Status::Loading);
+        let mut live = Live { scene, names };
+        use_stt(move |event| match event {
+            Event::Started(device) => status.set(Status::Listening(device)),
+            Event::Failed(err) => status.set(Status::Failed(err)),
+            event => live.on_event(event),
+        });
 
         let colors = use_theme().read().colors.clone();
 

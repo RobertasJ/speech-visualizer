@@ -17,21 +17,24 @@ separate display window.
 
 ## Layout
 
-- `stt.rs`: `Transcriber`, audio capture with cpal, VAD, and whisper passes on a
-  worker thread. It emits `Event::Live`, `Event::Final` and `Event::Error`.
-  - `stt/ui/`: the Freya side of it, `use_transcriber` + `Status` and `Diagnostics`.
+- `stt.rs`: `run()` loads the models, captures audio with cpal, and does VAD and
+  whisper passes until stopped, blocking. It emits `Event::Started`, then `Live` /
+  `Final` / `Error` (stream errors, recording goes on), and returns an `Error` on failure.
+  - `stt/ui/`: the Freya side of it. `use_stt(on_event)` runs `run()` on a thread and
+    calls `on_event` on the UI thread for each event, ending with `Event::Failed` if it
+    errors. Also `Status` (for screens to show) and `Diagnostics`.
 - `scene.rs`: the element tree.
   - `scene/command.rs` / `scene/names.rs`: parse and apply text commands to a scene;
     names map words to element ids.
   - `scene/ui/`: `use_scene()` creates a scene owned by the calling component, and the
     display window (`display.rs`) lives as long as it does. `window.rs` has
     `spawn_window` / `WindowHandle`, a window that closes when its handle is dropped.
-- `live.rs`: turns final transcription text into commands.
+- `live.rs`: `Live` turns final transcription text into commands.
 - `options.rs`: the choices made on the selection screen.
 - `ui/`: one component per screen (`Selection`, `Session`, `Console`, `LiveSession`)
   plus `NavBack`.
 - Each module's UI code goes in its own `ui/` subfolder. The modules re-export what
-  callers need (`scene::{Command, Names, use_scene}`, `stt::use_transcriber`).
+  callers need (`scene::{Command, Names, use_scene}`, `stt::use_stt`).
 - Unit tests are inline at the bottom of their module, in `#[cfg(test)] mod tests`.
   Modules use `foo.rs` + `foo/`, never `mod.rs`.
 
@@ -43,14 +46,14 @@ separate display window.
 - The current `Screen` is provided as context in `SpeechApp` and read with
   `use_consume::<State<Screen>>()`.
 - Resources tied to a screen are hooks owned by the screen's component (`use_scene`,
-  `use_transcriber`), which clean up when it unmounts. Don't thread them through props
+  `use_stt`), which clean up when it unmounts. Don't thread them through props
   or globals.
 
-## Transcriber shutdown
+## Stopping speech to text
 
-- If the process exits while whisper is still using the GPU, ggml aborts. So the
-  transcriber must be dropped (its thread joined) before exit.
-- `use_transcriber` drops it synchronously in `use_drop`. Freya runs `use_drop` when a
+- If the process exits while whisper is still using the GPU, ggml aborts. So the stt
+  thread must be stopped and joined before exit.
+- `use_stt` sets the stop flag and joins the thread synchronously in `use_drop`. Freya runs `use_drop` when a
   window closes, before the event loop exits, so this also covers quitting.
-- Stopping takes less than a frame, so the synchronous drop is fine. Don't move it to a
+- Stopping takes less than a frame, so the synchronous join is fine. Don't move it to a
   background thread.

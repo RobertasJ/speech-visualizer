@@ -1,10 +1,8 @@
 mod ui;
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -48,8 +46,10 @@ pub struct Config {
     pub pause_ms: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Event {
+    /// Setup is done and recording has started from this device.
+    Started(DeviceInfo),
     /// Text of the open section so far; replaces the previous Live text.
     Live {
         text: String,
@@ -65,9 +65,10 @@ pub enum Event {
         pass_ms: u32,
         timing: Timing,
     },
-    /// Transcription stopped because of an error. Errors reported by the audio
-    /// stream are sent here too, but don't stop it.
+    /// An error from the audio stream; recording goes on.
     Error(String),
+    /// Stopped because of this error, during setup or after. Nothing comes after it.
+    Failed(Error),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -108,6 +109,10 @@ pub enum Error {
     BuildStream(cpal::Error),
     #[error("failed to start input stream: {0}")]
     PlayStream(cpal::Error),
+    #[error("audio channel closed")]
+    AudioClosed,
+    #[error("transcription failed: {0}")]
+    Transcribe(WhisperError),
 }
 
 #[derive(Debug, Clone)]
@@ -117,79 +122,7 @@ pub struct DeviceInfo {
     pub channels: u16,
 }
 
-/// Records and transcribes on a worker thread until dropped.
-pub struct Transcriber {
-    device: DeviceInfo,
-    pause_ms: Arc<AtomicU32>,
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl Transcriber {
-    /// Loads the models and starts recording from the default input device. Events
-    /// are passed to `on_event` on the worker thread.
-    pub fn start(
-        config: Config,
-        mut on_event: impl FnMut(Event) + Send + 'static,
-    ) -> Result<Self, Error> {
-        let pause_ms = Arc::new(AtomicU32::new(config.pause_ms));
-        let stop = Arc::new(AtomicBool::new(false));
-
-        // Everything is set up inside the thread (the stream isn't Send), which then
-        // reports back once, before it starts transcribing.
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let thread = thread::spawn({
-            let (pause_ms, stop) = (pause_ms.clone(), stop.clone());
-            move || match Worker::open(&config) {
-                Ok((worker, device)) => {
-                    let _ = ready_tx.send(Ok(device));
-                    if let Err(err) = worker.run(&pause_ms, &stop, &mut on_event) {
-                        on_event(Event::Error(err));
-                    }
-                }
-                Err(err) => {
-                    let _ = ready_tx.send(Err(err));
-                }
-            }
-        });
-
-        match ready_rx.recv() {
-            Ok(Ok(device)) => Ok(Self {
-                device,
-                pause_ms,
-                stop,
-                thread: Some(thread),
-            }),
-            Ok(Err(err)) => {
-                let _ = thread.join();
-                Err(err)
-            }
-            // The thread only goes without reporting if setup panicked.
-            Err(_) => std::panic::resume_unwind(
-                thread.join().expect_err("worker exited without reporting"),
-            ),
-        }
-    }
-
-    pub fn device(&self) -> &DeviceInfo {
-        &self.device
-    }
-
-    #[expect(dead_code, reason = "the GUI sets the pause length before starting")]
-    pub fn set_pause_ms(&self, ms: u32) {
-        self.pause_ms.store(ms, Ordering::Relaxed);
-    }
-}
-
-impl Drop for Transcriber {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
+/// What the mic stream sends to [`run`].
 enum Input {
     /// Mono audio at the device rate.
     Audio(Vec<f32>),
@@ -197,248 +130,225 @@ enum Input {
     Error(cpal::Error),
 }
 
-struct Worker {
-    state: WhisperState,
-    vad: WhisperVadContext,
-    // Recording stops (and the mic is released) when this is dropped.
-    _stream: cpal::Stream,
-    rx: mpsc::Receiver<Input>,
-    rate: u32,
-    language: Option<String>,
-}
+/// Loads the models, then records from the default input device and transcribes until
+/// `stop` is set. Events are passed to `on_event` as they come, starting with
+/// [`Event::Started`] once setup is done.
+pub fn run(
+    config: &Config,
+    stop: &AtomicBool,
+    on_event: &mut impl FnMut(Event),
+) -> Result<(), Error> {
+    // Route whisper.cpp's log output into whisper-rs, which drops it without a log backend.
+    whisper_rs::install_logging_hooks();
 
-impl Worker {
-    fn open(config: &Config) -> Result<(Self, DeviceInfo), Error> {
-        // Route whisper.cpp's log output into whisper-rs, which drops it without a log backend.
-        whisper_rs::install_logging_hooks();
+    // --- Whisper: load the model once, reuse the state for every chunk ---
+    let ctx =
+        WhisperContext::new_with_params(&config.model_path, WhisperContextParameters::default())
+            .map_err(Error::LoadModel)?;
+    let mut state = ctx.create_state().map_err(Error::CreateState)?;
 
-        // --- Whisper: load the model once, reuse the state for every chunk ---
-        let ctx = WhisperContext::new_with_params(
-            &config.model_path,
-            WhisperContextParameters::default(),
-        )
-        .map_err(Error::LoadModel)?;
-        let state = ctx.create_state().map_err(Error::CreateState)?;
+    // --- VAD: silero, only used to find where speech starts and pauses ---
+    let mut vad = WhisperVadContext::new(
+        &config.vad_path.to_string_lossy(),
+        WhisperVadContextParams::default(),
+    )
+    .map_err(Error::LoadVad)?;
 
-        // --- VAD: silero, only used to find where speech starts and pauses ---
-        let vad = WhisperVadContext::new(
-            &config.vad_path.to_string_lossy(),
-            WhisperVadContextParams::default(),
-        )
-        .map_err(Error::LoadVad)?;
+    // --- Mic: default input device at its native rate/format ---
+    let host = cpal::default_host();
+    let device = host.default_input_device().ok_or(Error::NoInputDevice)?;
+    let supported = device
+        .default_input_config()
+        .map_err(Error::NoDefaultConfig)?;
 
-        // --- Mic: default input device at its native rate/format ---
-        let host = cpal::default_host();
-        let device = host.default_input_device().ok_or(Error::NoInputDevice)?;
-        let supported = device
-            .default_input_config()
-            .map_err(Error::NoDefaultConfig)?;
+    let info = DeviceInfo {
+        name: device
+            .description()
+            .map(|d| d.name().to_owned())
+            .unwrap_or_default(),
+        sample_rate: supported.sample_rate(),
+        channels: supported.channels(),
+    };
+    let channels = supported.channels() as usize;
+    let sample_format = supported.sample_format();
+    let stream_config: cpal::StreamConfig = supported.into();
 
-        let info = DeviceInfo {
-            name: device
-                .description()
-                .map(|d| d.name().to_owned())
-                .unwrap_or_default(),
-            sample_rate: supported.sample_rate(),
-            channels: supported.channels(),
-        };
-        let channels = supported.channels() as usize;
-        let sample_format = supported.sample_format();
-        let stream_config: cpal::StreamConfig = supported.into();
+    // The audio callback runs on cpal's thread and sends mono chunks here.
+    let (tx, rx) = mpsc::channel();
 
-        // The audio callback runs on cpal's thread and sends mono chunks here.
-        let (tx, rx) = mpsc::channel();
-
-        let stream = match sample_format {
-            SampleFormat::F32 => build_stream::<f32>(&device, stream_config, channels, tx),
-            SampleFormat::I16 => build_stream::<i16>(&device, stream_config, channels, tx),
-            SampleFormat::U16 => build_stream::<u16>(&device, stream_config, channels, tx),
-            other => return Err(Error::UnsupportedSampleFormat(other)),
-        }
-        .map_err(Error::BuildStream)?;
-        stream.play().map_err(Error::PlayStream)?;
-
-        let worker = Self {
-            state,
-            vad,
-            _stream: stream,
-            rx,
-            rate: info.sample_rate,
-            language: config.language.clone(),
-        };
-        Ok((worker, info))
+    // Recording stops (and the mic is released) when this is dropped, on return.
+    let stream = match sample_format {
+        SampleFormat::F32 => build_stream::<f32>(&device, stream_config, channels, tx),
+        SampleFormat::I16 => build_stream::<i16>(&device, stream_config, channels, tx),
+        SampleFormat::U16 => build_stream::<u16>(&device, stream_config, channels, tx),
+        other => return Err(Error::UnsupportedSampleFormat(other)),
     }
+    .map_err(Error::BuildStream)?;
+    stream.play().map_err(Error::PlayStream)?;
 
-    fn run(
-        mut self,
-        pause_ms: &AtomicU32,
-        stop: &AtomicBool,
-        on_event: &mut impl FnMut(Event),
-    ) -> Result<(), String> {
-        // --- Main loop: sections of speech cut at pauses, re-transcribed until final ---
-        let rate = self.rate;
-        let samples = |ms: u32| (rate as u64 * ms as u64 / 1000) as usize;
-        let min_len = samples(MIN_SECS * 1000);
-        let vad_len = samples(VAD_CONTEXT_SECS * 1000);
-        let pre_roll = samples(PRE_ROLL_MS);
-        let trailing = samples(TRAILING_SILENCE_MS);
-        let force_len = samples(FORCE_CUT_SECS * 1000);
-        let max_len = samples(MAX_SECTION_SECS * 1000);
-        let vad_step = samples(VAD_STEP_MS);
-        let language = self.language.as_deref().unwrap_or("auto");
+    let rate = info.sample_rate;
+    on_event(Event::Started(info));
 
-        // Device-rate audio: the open section, plus whatever came before it that the VAD
-        // and pre-roll still need. While idle only the newest VAD_CONTEXT_SECS are kept.
-        let mut buf: Vec<f32> = Vec::new();
-        // Start of the open section in `buf`; None while idle.
-        let mut section: Option<usize> = None;
-        // Where the VAD last saw speech end in `buf`, while a section is open.
-        let mut speech_end = 0usize;
-        // Segments of the previous pass over the open section, to agree on a cut point.
-        let mut prev: Vec<Segment> = Vec::new();
-        // Text of the last Live event, so unchanged passes aren't reported again.
-        let mut live = String::new();
-        let mut new_samples = 0;
-        let mut waited = Duration::ZERO;
+    // --- Main loop: sections of speech cut at pauses, re-transcribed until final ---
+    let samples = |ms: u32| (rate as u64 * ms as u64 / 1000) as usize;
+    let min_len = samples(MIN_SECS * 1000);
+    let vad_len = samples(VAD_CONTEXT_SECS * 1000);
+    let pre_roll = samples(PRE_ROLL_MS);
+    let trailing = samples(TRAILING_SILENCE_MS);
+    let force_len = samples(FORCE_CUT_SECS * 1000);
+    let max_len = samples(MAX_SECTION_SECS * 1000);
+    let vad_step = samples(VAD_STEP_MS);
+    let language = config.language.as_deref().unwrap_or("auto");
 
-        loop {
-            // Block until there's new audio, then take everything that queued up while
-            // the previous pass was running so we always work on the latest audio.
-            let recv_start = Instant::now();
-            let received = self.rx.recv_timeout(STOP_POLL);
-            waited += recv_start.elapsed();
-            let first = match received {
-                Ok(input) => Some(input),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => return Err("audio channel closed".into()),
-            };
-            if stop.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            for input in first.into_iter().chain(self.rx.try_iter()) {
-                match input {
-                    Input::Audio(chunk) => {
-                        new_samples += chunk.len();
-                        buf.extend(chunk);
-                    }
-                    Input::Error(err) => on_event(Event::Error(format!("stream error: {err}"))),
+    // Device-rate audio: the open section, plus whatever came before it that the VAD
+    // and pre-roll still need. While idle only the newest VAD_CONTEXT_SECS are kept.
+    let mut buf: Vec<f32> = Vec::new();
+    // Start of the open section in `buf`; None while idle.
+    let mut section: Option<usize> = None;
+    // Where the VAD last saw speech end in `buf`, while a section is open.
+    let mut speech_end = 0usize;
+    // Segments of the previous pass over the open section, to agree on a cut point.
+    let mut prev: Vec<Segment> = Vec::new();
+    // Text of the last Live event, so unchanged passes aren't reported again.
+    let mut live = String::new();
+    let mut new_samples = 0;
+    let mut waited = Duration::ZERO;
+
+    loop {
+        // Block until there's new audio, then take everything that queued up while
+        // the previous pass was running so we always work on the latest audio.
+        let recv_start = Instant::now();
+        let received = rx.recv_timeout(STOP_POLL);
+        waited += recv_start.elapsed();
+        let first = match received {
+            Ok(input) => Some(input),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => return Err(Error::AudioClosed),
+        };
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        for input in first.into_iter().chain(rx.try_iter()) {
+            match input {
+                Input::Audio(chunk) => {
+                    new_samples += chunk.len();
+                    buf.extend(chunk);
                 }
+                Input::Error(err) => on_event(Event::Error(format!("stream error: {err}"))),
             }
-            if new_samples < vad_step {
-                continue;
-            }
-            let new_audio_ms = samples_to_ms(std::mem::take(&mut new_samples), rate);
-            let wait_ms = millis(std::mem::take(&mut waited));
+        }
+        if new_samples < vad_step {
+            continue;
+        }
+        let new_audio_ms = samples_to_ms(std::mem::take(&mut new_samples), rate);
+        let wait_ms = millis(std::mem::take(&mut waited));
 
-            let pause_ms = pause_ms.load(Ordering::Relaxed);
-            let pause_len = samples(pause_ms);
+        let pause_ms = config.pause_ms;
+        let pause_len = samples(pause_ms);
 
-            // VAD over the newest few seconds. On error (e.g. too little audio yet) just
-            // wait for more.
-            let ctx_start = buf.len().saturating_sub(vad_len);
-            let vad_start = Instant::now();
-            let Ok(speech) = detect_speech(&mut self.vad, &buf[ctx_start..], rate, pause_ms) else {
-                continue;
-            };
-            let vad_ms = millis(vad_start.elapsed());
-            let timing = |audio_len: usize| Timing {
-                wait_ms,
-                new_audio_ms,
-                vad_ms,
-                audio_ms: samples_to_ms(audio_len, rate),
-                sent_at: Instant::now(),
-            };
-            // A pause: no speech at all, or the last speech ended at least pause_ms ago.
-            let paused = speech.is_none_or(|(_, end)| buf.len() - (ctx_start + end) >= pause_len);
+        // VAD over the newest few seconds. On error (e.g. too little audio yet) just
+        // wait for more.
+        let ctx_start = buf.len().saturating_sub(vad_len);
+        let vad_start = Instant::now();
+        let Ok(speech) = detect_speech(&mut vad, &buf[ctx_start..], rate, pause_ms) else {
+            continue;
+        };
+        let vad_ms = millis(vad_start.elapsed());
+        let timing = |audio_len: usize| Timing {
+            wait_ms,
+            new_audio_ms,
+            vad_ms,
+            audio_ms: samples_to_ms(audio_len, rate),
+            sent_at: Instant::now(),
+        };
+        // A pause: no speech at all, or the last speech ended at least pause_ms ago.
+        let paused = speech.is_none_or(|(_, end)| buf.len() - (ctx_start + end) >= pause_len);
 
-            let start = match (section, speech) {
-                (Some(start), _) => {
-                    if let Some((_, end)) = speech {
-                        speech_end = ctx_start + end;
-                    }
-                    start
-                }
-                // Speech while idle opens a section, starting a little before it.
-                (None, Some((first, end))) => {
-                    let start = (ctx_start + first).saturating_sub(pre_roll);
-                    section = Some(start);
+        let start = match (section, speech) {
+            (Some(start), _) => {
+                if let Some((_, end)) = speech {
                     speech_end = ctx_start + end;
-                    prev.clear();
-                    start
                 }
-                // Still idle: audio outside a section is never transcribed.
-                (None, None) => {
-                    buf.drain(..buf.len().saturating_sub(vad_len));
-                    continue;
-                }
-            };
-
-            let len = buf.len() - start;
-
-            if paused || len >= max_len {
-                // The section is over: one final pass over all of it (after a pause, with a
-                // little of the trailing silence). Its text is never revised.
-                let end = if paused {
-                    (speech_end + trailing).clamp(start, buf.len())
-                } else {
-                    start + max_len
-                };
-                let (segments, pass_ms) =
-                    transcribe(&mut self.state, &buf[start..end], rate, language)?;
-                on_event(Event::Final {
-                    text: joined(&segments),
-                    reason: if paused { End::Pause } else { End::MaxLength },
-                    pass_ms,
-                    timing: timing(end - start),
-                });
-                buf.drain(..end);
-                section = None;
-                prev.clear();
-                live.clear();
-            } else if len >= min_len {
-                let (mut segments, pass_ms) =
-                    transcribe(&mut self.state, &buf[start..], rate, language)?;
-
-                // A long section is cut at a segment end both passes agree on: the text up
-                // to there is final, and the rest of the audio starts a new open section.
-                let mut cut_text = None;
-                if len >= force_len
-                    && let Some(k) = agreed_cut(&prev, &segments)
-                {
-                    let cut_cs = segments[k].end_cs;
-                    let cut = (start + cs_to_samples(cut_cs, rate)).min(buf.len());
-                    cut_text = Some(joined(&segments[..=k]));
-                    buf.drain(..cut);
-                    section = Some(0);
-                    speech_end = speech_end.saturating_sub(cut);
-                    // Keep the rest relative to the new section start for the next comparison.
-                    segments.drain(..=k);
-                    for seg in &mut segments {
-                        seg.end_cs -= cut_cs;
-                    }
-                }
-
-                // Report a cut and the text after it back to back, so they show up together.
-                let text = joined(&segments);
-                if let Some(cut_text) = cut_text {
-                    on_event(Event::Final {
-                        text: cut_text,
-                        reason: End::Cut,
-                        pass_ms,
-                        timing: timing(len),
-                    });
-                    live.clear();
-                }
-                if text != live {
-                    live = text;
-                    on_event(Event::Live {
-                        text: live.clone(),
-                        pass_ms,
-                        timing: timing(len),
-                    });
-                }
-                prev = segments;
+                start
             }
+            // Speech while idle opens a section, starting a little before it.
+            (None, Some((first, end))) => {
+                let start = (ctx_start + first).saturating_sub(pre_roll);
+                section = Some(start);
+                speech_end = ctx_start + end;
+                prev.clear();
+                start
+            }
+            // Still idle: audio outside a section is never transcribed.
+            (None, None) => {
+                buf.drain(..buf.len().saturating_sub(vad_len));
+                continue;
+            }
+        };
+
+        let len = buf.len() - start;
+
+        if paused || len >= max_len {
+            // The section is over: one final pass over all of it (after a pause, with a
+            // little of the trailing silence). Its text is never revised.
+            let end = if paused {
+                (speech_end + trailing).clamp(start, buf.len())
+            } else {
+                start + max_len
+            };
+            let (segments, pass_ms) = transcribe(&mut state, &buf[start..end], rate, language)?;
+            on_event(Event::Final {
+                text: joined(&segments),
+                reason: if paused { End::Pause } else { End::MaxLength },
+                pass_ms,
+                timing: timing(end - start),
+            });
+            buf.drain(..end);
+            section = None;
+            prev.clear();
+            live.clear();
+        } else if len >= min_len {
+            let (mut segments, pass_ms) = transcribe(&mut state, &buf[start..], rate, language)?;
+
+            // A long section is cut at a segment end both passes agree on: the text up
+            // to there is final, and the rest of the audio starts a new open section.
+            let mut cut_text = None;
+            if len >= force_len
+                && let Some(k) = agreed_cut(&prev, &segments)
+            {
+                let cut_cs = segments[k].end_cs;
+                let cut = (start + cs_to_samples(cut_cs, rate)).min(buf.len());
+                cut_text = Some(joined(&segments[..=k]));
+                buf.drain(..cut);
+                section = Some(0);
+                speech_end = speech_end.saturating_sub(cut);
+                // Keep the rest relative to the new section start for the next comparison.
+                segments.drain(..=k);
+                for seg in &mut segments {
+                    seg.end_cs -= cut_cs;
+                }
+            }
+
+            // Report a cut and the text after it back to back, so they show up together.
+            let text = joined(&segments);
+            if let Some(cut_text) = cut_text {
+                on_event(Event::Final {
+                    text: cut_text,
+                    reason: End::Cut,
+                    pass_ms,
+                    timing: timing(len),
+                });
+                live.clear();
+            }
+            if text != live {
+                live = text;
+                on_event(Event::Live {
+                    text: live.clone(),
+                    pass_ms,
+                    timing: timing(len),
+                });
+            }
+            prev = segments;
         }
     }
 }
@@ -478,7 +388,7 @@ fn transcribe(
     audio: &[f32],
     rate: u32,
     language: &str,
-) -> Result<(Vec<Segment>, u32), String> {
+) -> Result<(Vec<Segment>, u32), Error> {
     let mut audio = resample_linear(audio, rate, WHISPER_RATE);
     // A final pass can be shorter than whisper's 1 s minimum; pad it with silence.
     audio.resize(audio.len().max((WHISPER_RATE * MIN_SECS) as usize), 0.0);
@@ -496,9 +406,7 @@ fn transcribe(
     params.set_suppress_nst(true); // drop non-speech tokens like "[Music]"
 
     let started = Instant::now();
-    state
-        .full(params, &audio)
-        .map_err(|err| format!("transcription failed: {err}"))?;
+    state.full(params, &audio).map_err(Error::Transcribe)?;
     let pass_ms = millis(started.elapsed());
 
     let segments = state

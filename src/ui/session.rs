@@ -3,12 +3,10 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use freya::prelude::*;
-use futures_channel::mpsc;
-use futures_lite::StreamExt;
 
 use super::nav_back::NavBack;
 use crate::options::Options;
-use crate::stt::{Diagnostics, Event, ms_f64, use_transcriber};
+use crate::stt::{Diagnostics, Event, Status, ms_f64, use_stt};
 
 #[derive(PartialEq)]
 pub struct Session;
@@ -28,49 +26,41 @@ impl Component for Session {
             ..Default::default()
         });
 
-        let status = use_transcriber(|| {
-            let (event_tx, mut event_rx) = mpsc::unbounded();
-
-            // Cancelled when the session unmounts.
-            let arrived = arrived.clone();
-            spawn(async move {
-                while let Some(event) = event_rx.next().await {
-                    match event {
-                        Event::Live {
-                            text,
-                            pass_ms,
-                            timing,
-                        } => {
-                            diagnostics.write().record("live", pass_ms, timing);
-                            arrived.set(Some(Instant::now()));
-                            live.set(text);
-                        }
-                        Event::Final {
-                            text,
-                            pass_ms,
-                            timing,
-                            ..
-                        } => {
-                            diagnostics.write().record("final", pass_ms, timing);
-                            arrived.set(Some(Instant::now()));
-                            if !text.is_empty() {
-                                let mut transcript = transcript.write();
-                                if !transcript.is_empty() {
-                                    transcript.push(' ');
-                                }
-                                transcript.push_str(&text);
-                            }
-                            live.set(String::new());
-                        }
-                        Event::Error(err) => errors.write().push(err),
-                    }
-                    scroll.scroll_to(ScrollPosition::End, Direction::Vertical);
+        let mut status = use_state(|| Status::Loading);
+        let on_arrival = arrived.clone();
+        use_stt(move |event| {
+            match event {
+                Event::Started(device) => status.set(Status::Listening(device)),
+                Event::Live {
+                    text,
+                    pass_ms,
+                    timing,
+                } => {
+                    diagnostics.write().record("live", pass_ms, timing);
+                    on_arrival.set(Some(Instant::now()));
+                    live.set(text);
                 }
-            });
-
-            move |event| {
-                let _ = event_tx.unbounded_send(event);
+                Event::Final {
+                    text,
+                    pass_ms,
+                    timing,
+                    ..
+                } => {
+                    diagnostics.write().record("final", pass_ms, timing);
+                    on_arrival.set(Some(Instant::now()));
+                    if !text.is_empty() {
+                        let mut transcript = transcript.write();
+                        if !transcript.is_empty() {
+                            transcript.push(' ');
+                        }
+                        transcript.push_str(&text);
+                    }
+                    live.set(String::new());
+                }
+                Event::Error(err) => errors.write().push(err),
+                Event::Failed(err) => status.set(Status::Failed(err)),
             }
+            scroll.scroll_to(ScrollPosition::End, Direction::Vertical);
         });
 
         if let Some(at) = arrived.take() {
