@@ -1,8 +1,8 @@
 use freya::prelude::*;
 use freya::winit::window::Fullscreen;
 
-use super::{ElementId, Scene};
-use crate::window::{WindowHandle, spawn_window};
+use super::window::{WindowHandle, spawn_window};
+use crate::scene::{self, ElementId, Scene};
 
 /// Opens a window showing `scene`, which closes when the handle is dropped.
 pub fn spawn(scene: State<Scene>) -> WindowHandle {
@@ -52,14 +52,14 @@ impl App for DisplayWindow {
 
 fn view(scene: &Scene, id: ElementId) -> Element {
     match scene.get(id) {
-        Some(super::Element::Rect { children }) => rect()
+        Some(scene::Element::Rect { children }) => rect()
             .key(id)
             .padding(8.)
             .spacing(8.)
             .border(Border::new().fill((128, 128, 128)).width(1.))
             .children(children.iter().map(|&child| view(scene, child)))
             .into(),
-        Some(super::Element::Text { text }) => label().key(id).text(text.clone()).into(),
+        Some(scene::Element::Text { text }) => label().key(id).text(text.clone()).into(),
         // The scene only links ids of elements it has.
         None => rect().key(id).into(),
     }

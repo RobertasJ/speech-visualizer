@@ -1,3 +1,5 @@
+mod ui;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -11,6 +13,8 @@ use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperError,
     WhisperState, WhisperVadContext, WhisperVadContextParams, WhisperVadParams,
 };
+
+pub use ui::*;
 
 const WHISPER_RATE: u32 = 16_000;
 // Whisper rejects clips shorter than 1 s, so wait for this much before the first pass.

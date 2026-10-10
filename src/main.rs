@@ -1,11 +1,8 @@
-mod command;
 mod live;
-mod names;
 mod options;
 mod scene;
 mod stt;
 mod ui;
-mod window;
 
 use freya::prelude::*;
 

@@ -1,9 +1,7 @@
 use freya::prelude::*;
 
 use super::nav_back::NavBack;
-use crate::command::Command;
-use crate::names::Names;
-use crate::scene::use_scene;
+use crate::scene::{Command, Names, use_scene};
 
 #[derive(PartialEq)]
 pub struct Console;

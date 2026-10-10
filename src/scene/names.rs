@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::scene::ElementId;
+use super::ElementId;
 
 /// Lowercase names and the elements they're on. Starts out as [`number_names`], so a
 /// name can be on an element that doesn't exist yet. Kept apart from the scene, so it

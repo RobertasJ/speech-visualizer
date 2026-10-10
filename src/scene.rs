@@ -1,12 +1,16 @@
 //! What the display window shows: a tree of elements, changed through [`Scene`]'s
 //! methods and rendered from scratch after every change.
 
-mod display;
+mod command;
+mod names;
+mod ui;
 
 use std::collections::HashMap;
 use std::fmt;
 
-use freya::prelude::*;
+pub use command::Command;
+pub use names::Names;
+pub use ui::use_scene;
 
 /// Identifies an element. Assigned by the [`Scene`] when the element is added, and
 /// never reused, even after the element is removed.
@@ -33,14 +37,6 @@ pub enum SceneError {
     ExpectedRect(ElementId),
     #[error("element {0} is not text")]
     ExpectedText(ElementId),
-}
-
-/// Creates a scene owned by the calling component, and shows it in a window of its own
-/// that closes when the component unmounts.
-pub fn use_scene() -> State<Scene> {
-    let scene = use_state(Scene::default);
-    use_state(|| display::spawn(scene));
-    scene
 }
 
 /// A change that fails changes nothing.
@@ -153,5 +149,68 @@ impl Scene {
 }
 
 #[cfg(test)]
-#[path = "scene_tests.rs"]
-mod tests;
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adds_nested_elements_with_fresh_ids() {
+        let mut scene = Scene::default();
+        let rect = scene.add_rect(None).unwrap();
+        let text = scene.add_text(Some(rect), "Hello there".into()).unwrap();
+        assert_eq!((rect, text), (ElementId(1), ElementId(2)));
+        assert_eq!(scene.roots(), &[rect]);
+        assert_eq!(
+            scene.get(rect),
+            Some(&Element::Rect {
+                children: vec![text]
+            })
+        );
+        assert_eq!(
+            scene.get(text),
+            Some(&Element::Text {
+                text: "Hello there".into()
+            })
+        );
+    }
+
+    #[test]
+    fn remove_takes_children_and_ids_are_not_reused() {
+        let mut scene = Scene::default();
+        let outer = scene.add_rect(None).unwrap();
+        let inner = scene.add_rect(Some(outer)).unwrap();
+        let text = scene.add_text(Some(inner), "deep".into()).unwrap();
+        assert_eq!(scene.remove(outer), Ok(vec![outer, inner, text]));
+        assert!(scene.roots().is_empty());
+        assert_eq!(scene.get(text), None);
+        assert_eq!(scene.add_text(None, "again".into()), Ok(ElementId(4)));
+    }
+
+    #[test]
+    fn clear_does_not_reuse_ids() {
+        let mut scene = Scene::default();
+        scene.add_rect(None).unwrap();
+        scene.clear();
+        assert!(scene.roots().is_empty());
+        assert_eq!(scene.add_rect(None), Ok(ElementId(2)));
+    }
+
+    #[test]
+    fn failed_changes_change_nothing() {
+        let mut scene = Scene::default();
+        let text = scene.add_text(None, "hi".into()).unwrap();
+        let before = scene.clone();
+        assert_eq!(
+            scene.add_rect(Some(text)),
+            Err(SceneError::ExpectedRect(text))
+        );
+        assert_eq!(
+            scene.set_text(ElementId(9), "x".into()),
+            Err(SceneError::Missing(ElementId(9)))
+        );
+        assert_eq!(
+            scene.remove(ElementId(9)),
+            Err(SceneError::Missing(ElementId(9)))
+        );
+        assert_eq!(scene, before);
+    }
+}

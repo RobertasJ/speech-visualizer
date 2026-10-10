@@ -1,10 +1,9 @@
 use freya::prelude::*;
 
 use super::nav_back::NavBack;
-use super::transcriber::use_transcriber;
 use crate::live;
-use crate::names::Names;
-use crate::scene::{self, ElementId, Scene, use_scene};
+use crate::scene::{self, ElementId, Names, Scene, use_scene};
+use crate::stt::use_transcriber;
 
 #[derive(PartialEq)]
 pub struct LiveSession;

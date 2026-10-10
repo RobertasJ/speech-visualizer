@@ -6,11 +6,9 @@ use freya::prelude::*;
 use futures_channel::mpsc;
 use futures_lite::StreamExt;
 
-use super::diagnostics::{Diagnostics, ms_f64};
 use super::nav_back::NavBack;
-use super::transcriber::use_transcriber;
 use crate::options::Options;
-use crate::stt::Event;
+use crate::stt::{Diagnostics, Event, ms_f64, use_transcriber};
 
 #[derive(PartialEq)]
 pub struct Session;

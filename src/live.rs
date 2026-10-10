@@ -2,9 +2,7 @@ use freya::prelude::State;
 use futures_channel::mpsc;
 use futures_lite::StreamExt;
 
-use crate::command::Command;
-use crate::names::Names;
-use crate::scene::Scene;
+use crate::scene::{Command, Names, Scene};
 use crate::stt::Event;
 
 /// Starts the live logic as a task of the calling component, on the UI thread where
@@ -66,5 +64,14 @@ fn normalize(text: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "live_tests.rs"]
-mod tests;
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_drops_punctuation_and_case() {
+        assert_eq!(
+            normalize(" Text in 3, Hello World."),
+            " text in 3 hello world"
+        );
+    }
+}
