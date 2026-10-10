@@ -32,7 +32,8 @@ separate display window.
   - `scene/ui/`: `use_scene()` creates a scene owned by the calling component, and the
     display window (`display.rs`) lives as long as it does. `window.rs` has
     `spawn_window` / `WindowHandle`, a window that closes when its handle is dropped.
-- `live.rs`: `Live` turns final transcription text into commands.
+- `live.rs`: `use_live(scene, names)` runs `use_stt` and turns final transcription text
+  into commands for the scene. Returns a `UseLive` handle (`status()` for screens).
 - `options.rs`: the choices made on the selection screen.
 - `ui/`: one component per screen (`Selection`, `Session`, `Console`, `LiveSession`)
   plus `NavBack`.
