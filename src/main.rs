@@ -13,7 +13,7 @@ use options::Options;
 use ui::{Console, LiveSession, Selection, Session};
 
 fn main() {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     let mut options = Options::default();
     if let Some(dir) = std::env::args().nth(1) {
