@@ -210,14 +210,17 @@ mod tests {
     fn printing_an_element_shows_it_or_throws_if_it_was_removed() {
         let (mut script, _) = script();
         assert_eq!(
-            ok(&mut script, r#"let t = text("Hi"); print(t); debug(t);"#),
-            [r#"#1 text "Hi""#, r#"#1 text "Hi""#]
+            ok(
+                &mut script,
+                r#"let t = paragraph().add_span("Hi"); print(t); debug(t);"#
+            ),
+            [r#"#2 span "Hi""#, r#"#2 span "Hi""#]
         );
         ok(&mut script, "t.remove();");
         let outcome = script.run(r#"print("before"); print(t)"#);
         assert_eq!(outcome.output, ["before"]);
         let error = outcome.error.unwrap();
-        assert!(error.contains("no element 1"), "{error}");
+        assert!(error.contains("no element 2"), "{error}");
     }
 
     #[test]
@@ -286,15 +289,17 @@ mod tests {
         let (mut script, scene) = script();
         ok(
             &mut script,
-            r#"let r = rect(); r.desc = "page header"; r.add_text("Hi");"#,
+            r#"let r = rect(); r.desc = "page header"; r.add_paragraph().add_span("Hi");"#,
         );
         assert_eq!(
             serde_json::to_value(&*scene.borrow()).unwrap(),
             json!({
-                "next_id": 3,
-                "elements": [
-                    {"id": 1, "desc": "page header", "rect": [{"id": 2, "text": "Hi"}]},
-                ],
+                "next_id": 4,
+                "root": {"id": 0, "rect": [
+                    {"id": 1, "desc": "page header", "rect": [
+                        {"id": 2, "paragraph": [{"id": 3, "span": "Hi"}]},
+                    ]},
+                ], "width": "fill", "height": "fill"},
             })
         );
     }

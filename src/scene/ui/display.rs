@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use freya::prelude::*;
 use freya::winit::window::Fullscreen;
 
@@ -25,10 +27,10 @@ impl App for DisplayWindow {
 
         // The scene goes with the component that owns it, which can unmount a moment
         // before this window is closed: show nothing until then.
-        let elements: Vec<Element> = match self.scene.try_read() {
-            Some(scene) => scene.roots().iter().map(|&id| view(&scene, id)).collect(),
-            None => Vec::new(),
-        };
+        let root = self
+            .scene
+            .try_read()
+            .map(|scene| view(&scene, ElementId::ROOT));
 
         let toggle_fullscreen = |e: Event<KeyboardEventData>| {
             if e.key == Key::Named(NamedKey::F11) {
@@ -41,26 +43,103 @@ impl App for DisplayWindow {
 
         rect()
             .expanded()
-            .padding(16.)
-            .spacing(8.)
             .theme_background()
             .theme_color()
             .on_global_key_down(toggle_fullscreen)
-            .children(elements)
+            .children(root)
     }
 }
 
+/// The element `id` is, as Freya draws it, with what's in it: the scene keeps Freya's
+/// own elements, so this only adds their children, and a paragraph's spans.
 fn view(scene: &Scene, id: ElementId) -> Element {
+    let key = DiffKey::from(&id.0);
+    let children = scene.children(id).unwrap_or_default();
     match scene.get(id) {
-        Some(scene::Element::Rect { children }) => rect()
-            .key(id)
-            .padding(8.)
-            .spacing(8.)
-            .border(Border::new().fill((128, 128, 128)).width(1.))
-            .children(children.iter().map(|&child| view(scene, child)))
-            .into(),
-        Some(scene::Element::Text { text }) => label().key(id).text(text.clone()).into(),
-        // The scene only links ids of elements it has.
-        None => rect().key(id).into(),
+        Some(scene::Element::Rect(rect)) => Element::Element {
+            key,
+            element: Rc::new(rect.clone()),
+            elements: children.iter().map(|&child| view(scene, child)).collect(),
+        },
+        Some(scene::Element::Paragraph(paragraph)) => {
+            let mut paragraph = paragraph.clone();
+            paragraph.spans = children
+                .iter()
+                .filter_map(|&child| match scene.get(child) {
+                    Some(scene::Element::Span(span)) => Some(span.clone()),
+                    _ => None,
+                })
+                .collect();
+            Element::Element {
+                key,
+                element: Rc::new(paragraph),
+                elements: Vec::new(),
+            }
+        }
+        // Spans are drawn by their paragraph, and the scene only links ids it has.
+        Some(scene::Element::Span(_)) | None => rect().key(id.0).into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use freya::elements::paragraph::ParagraphElement;
+    use freya::elements::rect::RectElement;
+
+    use super::*;
+
+    /// The rect `element` draws, and what's in it.
+    fn rect_of(element: &Element) -> (RectElement, &[Element]) {
+        let Element::Element {
+            element, elements, ..
+        } = element
+        else {
+            panic!("expected an element")
+        };
+        (
+            Rect::try_downcast(element.as_ref()).expect("a rect"),
+            elements,
+        )
+    }
+
+    /// The paragraph `element` draws, and its inline elements.
+    fn paragraph_of(element: &Element) -> (ParagraphElement, &[Element]) {
+        let Element::Element {
+            element, elements, ..
+        } = element
+        else {
+            panic!("expected an element")
+        };
+        let paragraph = Paragraph::try_downcast(element.as_ref()).expect("a paragraph");
+        (paragraph, elements)
+    }
+
+    #[test]
+    fn draws_the_scenes_own_elements_with_their_children() {
+        let mut scene = Scene::default();
+        let card = scene.add_rect(ElementId::ROOT).unwrap();
+        scene.set_property(card, "background", "red").unwrap();
+        let paragraph = scene.add_paragraph(card).unwrap();
+        scene.set_property(paragraph, "max_lines", "2").unwrap();
+        let hello = scene.add_span(paragraph, "Hello ".into()).unwrap();
+        scene.set_property(hello, "font_weight", "bold").unwrap();
+        scene.add_span(paragraph, "world".into()).unwrap();
+
+        let root = view(&scene, ElementId::ROOT);
+        let (root_rect, cards) = rect_of(&root);
+        assert_eq!(root_rect.layout.layout.width, Size::fill());
+
+        let (card_rect, paragraphs) = rect_of(&cards[0]);
+        assert_eq!(card_rect.style.background, Fill::Color(Color::RED));
+
+        let (drawn, inline) = paragraph_of(&paragraphs[0]);
+        assert!(inline.is_empty());
+        assert_eq!(drawn.max_lines, Some(2));
+        let texts: Vec<&str> = drawn.spans.iter().map(|span| span.text.as_ref()).collect();
+        assert_eq!(texts, ["Hello ", "world"]);
+        assert_eq!(
+            drawn.spans[0].text_style_data.font_weight,
+            Some(FontWeight::BOLD)
+        );
     }
 }

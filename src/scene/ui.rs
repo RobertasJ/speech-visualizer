@@ -29,7 +29,7 @@ mod tests {
     use freya_testing::TestingRunner;
 
     use super::*;
-    use crate::scene::Script;
+    use crate::scene::{ElementId, Script};
 
     fn app() -> impl IntoElement {
         rect()
@@ -43,8 +43,9 @@ mod tests {
             |runner| runner.provide_root_context(|| State::create(Scene::default())),
             1.,
         );
-        let outcome = test.run_in(|| Script::new(scene).run(r#"rect().add_text("hi").id"#));
-        assert_eq!(outcome.output, ["2"]);
-        assert_eq!(scene.peek().roots().len(), 1);
+        let outcome =
+            test.run_in(|| Script::new(scene).run(r#"rect().add_paragraph().add_span("hi").id"#));
+        assert_eq!(outcome.output, ["3"]);
+        assert_eq!(scene.peek().children(ElementId::ROOT).unwrap().len(), 1);
     }
 }

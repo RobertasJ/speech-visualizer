@@ -26,22 +26,41 @@ separate display window, by writing Rhai scripts.
   - `stt/ui/`: the Freya side of it. `use_stt(on_event)` runs `run()` on a thread and
     calls `on_event` on the UI thread for each event, ending with `Event::Failed` if it
     errors. Also `Status` (for screens to show) and `Diagnostics`.
-- `scene.rs`: the element tree. Elements can have a description. It serializes for the
-  agent as a nested tree, with `next_id`.
+- `scene.rs`: the element tree, under a root rect (id 0) that fills the window. Each
+  element is kept as Freya's own `RectElement`, `ParagraphElement` or `Span`, with its
+  parent, children and description beside it. A rect holds rects and paragraphs, a
+  paragraph only spans. It serializes for the agent as a nested tree with `next_id`,
+  each element listing only the properties that differ from a new one's.
+  - `scene/rect.rs`, `paragraph.rs`, `span.rs`: each kind, its own properties, and which
+    groups it has, reached where its Freya element keeps them (`PARTS`).
+  - `scene/style.rs`: properties (name, syntax, description, get/set) and shorthands,
+    in groups several kinds share: `style/layout.rs`, `container.rs`, `decoration.rs`,
+    `effects.rs`, `text.rs`. Setting does what Freya's setter does; the list ones
+    (`border`, `shadow`, `font_family`, `text_shadow`, `font_feature`) add one each time
+    and have a `clear_*`. Text properties default to `inherit`. The prompt and the
+    console help are generated from these tables.
+  - `scene/value.rs`: one module per kind of value, parsing the string scripts give,
+    written with Freya's Rust names (`fill`, `px(120)`, `width(2) fill(red)`), into
+    Freya's type and formatting it back the same way. `value/syntax.rs` is the
+    grammar. Freya hides a shadow's numbers, so `value/shadow.rs` reads them from its
+    `Display`; gradients aren't supported, since Freya hides their stops.
   - `scene/script.rs`: `Script` runs Rhai on a scene through a `Store` (for
     `State<Scene>` in `scene/ui.rs`; for `Rc<RefCell<Scene>>` in tests). Variables last
     between runs, a failed run is undone (the scene, and a deep copy of the variables),
     and `fn`s only last for their run. Engine limits keep scripts from hanging the UI
     thread.
-    - `script/api.rs`: the functions and the `Element` handle scripts use. Every use of
-      a removed element throws `no element <id>`. `print` and `debug` are registered for
+    - `script/api.rs`: the functions and the `Element` handle scripts use, and every
+      property as `e.name`, `e.name = value` (a string or a number) and a chainable
+      `e.name(value)`, plus the shorthands. Every use of a removed element throws
+      `no element <id>`. `print` and `debug` are registered for
       elements so printing throws too: rhai's own show a failing `to_string` as just
       the type name, which still happens in string interpolation, `+` and arrays.
     - `script/table.rs`: `FUNCTIONS`, one line each, for the console's help and the
       agent's prompt. Keep it in step with `api.rs`.
     - `script/show.rs`: values as text, for results and `variables()`.
   - `scene/ui/`: `use_scene()` creates a scene owned by the calling component, and the
-    display window (`display.rs`) lives as long as it does. `window.rs` has
+    display window (`display.rs`) lives as long as it does, drawing the stored Freya
+    elements with their children (and each paragraph's spans). `window.rs` has
     `spawn_window` / `WindowHandle`, a window that closes when its handle is dropped.
 - `live.rs`: live mode. `use_live(scene)` runs `use_stt` and wires the parts below; the
   `UseLive` it returns hands their state to the screen.
@@ -62,7 +81,7 @@ separate display window, by writing Rhai scripts.
 - `ui/`: one component per screen (`Selection`, `Session`, `Console`, `LiveSession`)
   plus `NavBack`.
 - Each module's UI code goes in its own `ui/` subfolder. The modules re-export what
-  callers need (`scene::{FUNCTIONS, Outcome, Script, use_scene}`,
+  callers need (`scene::{FUNCTIONS, Outcome, Script, property_docs, use_scene}`,
   `live::{use_live, TranscriptPanel, ActivityPanel}`, `stt::use_stt`).
 - Unit tests are inline at the bottom of their module, in `#[cfg(test)] mod tests`, so
   each part is tested on its own. Components are tested headlessly with

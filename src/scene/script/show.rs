@@ -39,12 +39,23 @@ pub(super) fn value(scene: &SceneRef, dynamic: &Dynamic) -> String {
 }
 
 /// An element as scripts print it: its id, kind, text if it has any, and description if
-/// it has one, like `#5 text "Hello" (greeting)` or `#4 rect (page header)`. Fails if it
-/// was removed.
+/// it has one, like `#5 span "Hello" (greeting)` or `#4 rect (page header)`. A
+/// paragraph's text is its spans'. Fails if it was removed.
 pub(super) fn element(scene: &Scene, id: ElementId) -> Result<String, SceneError> {
     let mut shown = match scene.get(id).ok_or(SceneError::Missing(id))? {
-        Element::Rect { .. } => format!("#{id} rect"),
-        Element::Text { text } => format!("#{id} text {text:?}"),
+        Element::Rect(_) => format!("#{id} rect"),
+        Element::Paragraph(_) => {
+            let texts: Vec<String> = scene
+                .children(id)?
+                .iter()
+                .filter_map(|&span| match scene.get(span) {
+                    Some(Element::Span(span)) => Some(span.text.to_string()),
+                    _ => None,
+                })
+                .collect();
+            format!("#{id} paragraph {:?}", texts.concat())
+        }
+        Element::Span(span) => format!("#{id} span {:?}", span.text),
     };
     let description = scene.description(id)?;
     if !description.is_empty() {
@@ -62,11 +73,15 @@ mod tests {
 
     use super::*;
 
+    /// A rect with a description, holding a paragraph of two spans.
     fn scene() -> (SceneRef, Rc<RefCell<Scene>>) {
         let mut scene = Scene::default();
-        let rect = scene.add_rect(None).unwrap();
+        let rect = scene.add_rect(ElementId::ROOT).unwrap();
         scene.set_description(rect, "page header".into()).unwrap();
-        scene.add_text(Some(rect), "Hello".into()).unwrap();
+        let paragraph = scene.add_paragraph(rect).unwrap();
+        scene.add_span(paragraph, "Hello ".into()).unwrap();
+        let world = scene.add_span(paragraph, "world".into()).unwrap();
+        scene.set_description(world, "who".into()).unwrap();
         let scene = Rc::new(RefCell::new(scene));
         (SceneRef::new(scene.clone()), scene)
     }
@@ -75,30 +90,23 @@ mod tests {
     fn elements_show_their_kind_text_and_description() {
         let (_, scene) = scene();
         let scene = scene.borrow();
-        assert_eq!(
-            element(&scene, ElementId(1)),
-            Ok("#1 rect (page header)".into())
-        );
-        assert_eq!(
-            element(&scene, ElementId(2)),
-            Ok(r#"#2 text "Hello""#.into())
-        );
-        assert_eq!(
-            element(&scene, ElementId(9)),
-            Err(SceneError::Missing(ElementId(9)))
-        );
+        let shown = |id| element(&scene, ElementId(id));
+        assert_eq!(shown(1), Ok("#1 rect (page header)".into()));
+        assert_eq!(shown(2), Ok(r#"#2 paragraph "Hello world""#.into()));
+        assert_eq!(shown(4), Ok(r#"#4 span "world" (who)"#.into()));
+        assert_eq!(shown(9), Err(SceneError::Missing(ElementId(9))));
     }
 
     #[test]
     fn values_show_like_rhai_literals() {
         let (scene, _) = scene();
-        let element = Dynamic::from(Handle(ElementId(2)));
+        let element = Dynamic::from(Handle(ElementId(3)));
         let array: Array = vec![Dynamic::from(1_i64), Dynamic::from("a\"b"), Dynamic::UNIT];
         let mut map = Map::new();
         map.insert("el".into(), element.clone());
         map.insert("n".into(), Dynamic::from(2.5_f64));
 
-        assert_eq!(value(&scene, &element), r#"#2 text "Hello""#);
+        assert_eq!(value(&scene, &element), r#"#3 span "Hello ""#);
         // A value is shown as it is, even an element that's gone.
         let removed = Dynamic::from(Handle(ElementId(9)));
         assert_eq!(value(&scene, &removed), "#9 (removed)");
@@ -106,7 +114,7 @@ mod tests {
         assert_eq!(value(&scene, &Dynamic::from(array)), r#"[1, "a\"b", ()]"#);
         assert_eq!(
             value(&scene, &Dynamic::from_map(map)),
-            r#"#{el: #2 text "Hello", n: 2.5}"#
+            r#"#{el: #3 span "Hello ", n: 2.5}"#
         );
         assert_eq!(value(&scene, &Dynamic::UNIT), "()");
         assert_eq!(value(&scene, &Dynamic::from(true)), "true");

@@ -86,6 +86,7 @@ mod tests {
     use rig::message::ToolFunction;
 
     use super::*;
+    use crate::scene::ElementId;
 
     fn call(name: &str, arguments: Value) -> ToolCall {
         let name = ToolName::new(name).unwrap();
@@ -127,13 +128,13 @@ mod tests {
         let (code, outcome) = run(&call(NAME, json!({"code": "rect()"})), &mut script);
         assert_eq!(code, "rect()");
         assert_eq!(outcome.output, ["#1 rect"]);
-        assert_eq!(scene.borrow().roots().len(), 1);
+        assert_eq!(scene.borrow().children(ElementId::ROOT).unwrap().len(), 1);
 
         // A call that can't be run doesn't touch the script.
         let (code, outcome) = run(&call("draw", json!({"code": "rect()"})), &mut script);
         assert_eq!(code, "");
         assert!(outcome.error.unwrap().contains("no tool called draw"));
-        assert_eq!(scene.borrow().roots().len(), 1);
+        assert_eq!(scene.borrow().children(ElementId::ROOT).unwrap().len(), 1);
     }
 
     #[test]
@@ -153,7 +154,7 @@ mod tests {
     #[test]
     fn result_is_the_outcome_then_the_scene() {
         let mut scene = Scene::default();
-        scene.add_rect(None).unwrap();
+        scene.add_rect(ElementId::ROOT).unwrap();
         let outcome = Outcome {
             output: vec!["hi".into()],
             error: None,

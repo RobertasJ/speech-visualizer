@@ -1,7 +1,7 @@
 use freya::prelude::*;
 
 use super::nav_back::NavBack;
-use crate::scene::{FUNCTIONS, Outcome, Script, use_scene};
+use crate::scene::{FUNCTIONS, Outcome, Script, property_docs, use_scene};
 
 #[derive(PartialEq)]
 pub struct Console;
@@ -42,38 +42,43 @@ impl Component for Console {
                     .color(colors.text_secondary),
             );
 
-        // The script functions, one per row.
+        // The script functions, then the properties, one per row.
         let help = ScrollView::new()
             .width(Size::fill())
-            .height(Size::px(110.))
+            .height(Size::px(150.))
             .child(
                 rect()
                     .width(Size::fill())
                     .padding((8., 12.))
                     .spacing(2.)
-                    .children(FUNCTIONS.iter().enumerate().map(|(i, function)| {
-                        rect()
-                            .key(i)
-                            .horizontal()
-                            .width(Size::fill())
-                            .content(Content::Flex)
-                            .spacing(12.)
-                            .child(
-                                label()
-                                    .width(Size::px(230.))
-                                    .font_size(13.)
-                                    .font_family("monospace")
-                                    .text(function.signature),
-                            )
-                            .child(
-                                label()
-                                    .width(Size::flex(1.))
-                                    .font_size(13.)
-                                    .color(colors.text_secondary)
-                                    .text(function.description),
-                            )
-                            .into_element()
-                    })),
+                    .children(
+                        help_rows()
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, (name, about))| {
+                                rect()
+                                    .key(i)
+                                    .horizontal()
+                                    .width(Size::fill())
+                                    .content(Content::Flex)
+                                    .spacing(12.)
+                                    .child(
+                                        label()
+                                            .width(Size::px(230.))
+                                            .font_size(13.)
+                                            .font_family("monospace")
+                                            .text(name),
+                                    )
+                                    .child(
+                                        label()
+                                            .width(Size::flex(1.))
+                                            .font_size(13.)
+                                            .color(colors.text_secondary)
+                                            .text(about),
+                                    )
+                                    .into_element()
+                            }),
+                    ),
             );
 
         let log =
@@ -131,4 +136,35 @@ impl Component for Console {
                 ),
             )
     }
+}
+
+/// What the help shows, a name and what it does on each row: the functions, then each
+/// property group, its properties and its shorthands.
+fn help_rows() -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = FUNCTIONS
+        .iter()
+        .map(|function| {
+            (
+                function.signature.to_owned(),
+                function.description.to_owned(),
+            )
+        })
+        .collect();
+    for (group, kinds) in property_docs() {
+        let kinds: Vec<&str> = kinds.iter().map(|kind| kind.name()).collect();
+        rows.push((
+            format!("{} ({})", group.name, kinds.join(", ")),
+            group.description.to_owned(),
+        ));
+        for property in &group.properties {
+            rows.push((
+                format!("  .{}", property.name),
+                format!("{} {}", property.description, property.syntax),
+            ));
+        }
+        for (name, description) in &group.shorthands {
+            rows.push((format!("  .{name}()"), (*description).to_owned()));
+        }
+    }
+    rows
 }

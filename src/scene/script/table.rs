@@ -1,9 +1,9 @@
 //! The script functions, described once for both the console's help and the agent's
-//! prompt.
+//! prompt. The properties are described by each kind of element's tables.
 
 /// A function scripts can call, as help shows it.
 pub struct Function {
-    /// How it's called, like `e.add_text(content) -> Element`. `e` is an element.
+    /// How it's called, like `p.add_span(text) -> Element`.
     pub signature: &'static str,
     /// What it does, in one line.
     pub description: &'static str,
@@ -16,44 +16,63 @@ const fn function(signature: &'static str, description: &'static str) -> Functio
     }
 }
 
-/// Every function scripts can call on the scene. `e` stands for an element.
+/// Every function scripts can call on the scene. `e` stands for any element, `r` for a
+/// rect and `p` for a paragraph.
 pub const FUNCTIONS: &[Function] = &[
     function(
         "el(id) -> Element",
         "The element with that id. Fails if there's none.",
     ),
     function(
-        "rect() -> Element",
-        "Adds an empty rect at the end of the top level.",
+        "root() -> Element",
+        "The rect that fills the window and holds everything; its id is 0.",
+    ),
+    function("rect() -> Element", "Adds a rect at the end of the root."),
+    function(
+        "paragraph() -> Element",
+        "Adds a paragraph at the end of the root.",
+    ),
+    function("clear()", "Removes everything in the root."),
+    function(
+        "r.add_rect() -> Element",
+        "Adds a rect at the end of rect r.",
     ),
     function(
-        "text(content) -> Element",
-        "Adds text at the end of the top level.",
-    ),
-    function("roots() -> [Element]", "The top-level elements, in order."),
-    function("clear()", "Removes every element."),
-    function(
-        "e.add_rect() -> Element",
-        "Adds an empty rect at the end of rect e.",
+        "r.add_paragraph() -> Element",
+        "Adds a paragraph at the end of rect r.",
     ),
     function(
-        "e.add_text(content) -> Element",
-        "Adds text at the end of rect e.",
+        "p.add_span(text) -> Element",
+        "Adds a span with that text at the end of paragraph p.",
     ),
-    function("e.text", "The text of text element e. Can be set."),
+    function("e.kind", "\"rect\", \"paragraph\" or \"span\"."),
+    function("e.id", "e's id."),
     function(
         "e.desc",
         "What e is for, \"\" if it has no description. Can be set.",
     ),
-    function("e.id", "e's id."),
-    function(
-        "e.parent",
-        "The rect e is in, or () if it's at the top level.",
-    ),
-    function("e.children", "The elements in rect e, in order."),
+    function("e.parent", "The element e is in, or () for the root."),
+    function("e.children", "The elements in e, in order."),
     function("e.remove()", "Removes e and everything in it."),
     function(
+        "e.name",
+        "Reads property `name`: a string, or an array of them for a list.",
+    ),
+    function(
+        "e.name = value",
+        "Sets property `name` from a string or a number. A list gets one more.",
+    ),
+    function(
+        "e.name(value) -> Element",
+        "Sets property `name` the same way, and gives e back, for chaining.",
+    ),
+    function("e.clear_name() -> Element", "Empties list property `name`."),
+    function(
+        "e.shorthand() -> Element",
+        "Applies a shorthand, like expanded(), and gives e back.",
+    ),
+    function(
         "print(e)",
-        "Shows e, like `#5 text \"Hello\" (greeting)` or `#4 rect (page header)`.",
+        "Shows e, like `#5 span \"Hello\" (greeting)` or `#4 rect (page header)`.",
     ),
 ];
