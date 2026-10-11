@@ -1,8 +1,7 @@
 //! What the display window shows: a tree of elements, changed through [`Scene`]'s
 //! methods and rendered from scratch after every change.
 
-mod command;
-mod names;
+mod script;
 mod ui;
 
 use std::collections::HashMap;
@@ -11,8 +10,7 @@ use std::fmt;
 use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
 
-pub use command::Command;
-pub use names::Names;
+pub use script::{FUNCTIONS, Outcome, Script};
 pub use ui::use_scene;
 
 /// Identifies an element. Assigned by the [`Scene`] when the element is added, and
@@ -55,6 +53,8 @@ struct Entry {
     element: Element,
     /// None = top level.
     parent: Option<ElementId>,
+    /// What the element is for, so it can be found later; empty if it has none.
+    description: String,
 }
 
 impl Scene {
@@ -82,6 +82,17 @@ impl Scene {
             Element::Text { text: old } => *old = text,
             Element::Rect { .. } => return Err(SceneError::ExpectedText(id)),
         }
+        Ok(())
+    }
+
+    /// Replaces the description of an element; empty means none.
+    pub fn set_description(
+        &mut self,
+        id: ElementId,
+        description: String,
+    ) -> Result<(), SceneError> {
+        let entry = self.entries.get_mut(&id).ok_or(SceneError::Missing(id))?;
+        entry.description = description;
         Ok(())
     }
 
@@ -124,6 +135,20 @@ impl Scene {
         self.entries.contains_key(&id)
     }
 
+    /// The description of an element; empty if it has none.
+    pub fn description(&self, id: ElementId) -> Result<&str, SceneError> {
+        self.entry(id).map(|entry| entry.description.as_str())
+    }
+
+    /// The rect an element is in, or None if it's at the top level.
+    pub fn parent(&self, id: ElementId) -> Result<Option<ElementId>, SceneError> {
+        self.entry(id).map(|entry| entry.parent)
+    }
+
+    fn entry(&self, id: ElementId) -> Result<&Entry, SceneError> {
+        self.entries.get(&id).ok_or(SceneError::Missing(id))
+    }
+
     fn add(
         &mut self,
         parent: Option<ElementId>,
@@ -132,7 +157,13 @@ impl Scene {
         let id = ElementId(self.last_id + 1);
         self.children_mut(parent)?.push(id);
         self.last_id = id.0;
-        self.entries.insert(id, Entry { element, parent });
+        let description = String::new();
+        let entry = Entry {
+            element,
+            parent,
+            description,
+        };
+        self.entries.insert(id, entry);
         Ok(id)
     }
 
@@ -152,10 +183,11 @@ impl Scene {
 }
 
 /// Serializes as the tree it is, for reading: the id the next element will get, and
-/// the top-level elements in order, each with its id and a rect with its children:
+/// the top-level elements in order, each with its id, its description if it has one,
+/// and a rect with its children:
 ///
 /// ```json
-/// {"next_id": 3, "elements": [{"id": 1, "rect": [{"id": 2, "text": "Hello"}]}]}
+/// {"next_id": 3, "elements": [{"id": 1, "desc": "header", "rect": [{"id": 2, "text": "Hi"}]}]}
 /// ```
 impl Serialize for Scene {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -176,14 +208,19 @@ impl Serialize for Nodes<'_> {
     }
 }
 
-/// An element of a scene, serialized with its id, and its children if it's a rect.
+/// An element of a scene, serialized with its id, its description if it has one, and
+/// its children if it's a rect.
 struct Node<'a>(&'a Scene, ElementId);
 
 impl Serialize for Node<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let Node(scene, id) = *self;
-        let mut map = serializer.serialize_map(Some(2))?;
+        let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("id", &id)?;
+        let description = scene.description(id).unwrap_or_default();
+        if !description.is_empty() {
+            map.serialize_entry("desc", description)?;
+        }
         match scene.get(id) {
             Some(Element::Rect { children }) => {
                 map.serialize_entry("rect", &Nodes(scene, children))?
@@ -263,9 +300,33 @@ mod tests {
     }
 
     #[test]
+    fn descriptions_and_parents() {
+        let mut scene = Scene::default();
+        let rect = scene.add_rect(None).unwrap();
+        let text = scene.add_text(Some(rect), "Hi".into()).unwrap();
+        assert_eq!(scene.description(rect), Ok(""));
+        assert_eq!(scene.set_description(rect, "header".into()), Ok(()));
+        assert_eq!(scene.description(rect), Ok("header"));
+        assert_eq!(scene.parent(rect), Ok(None));
+        assert_eq!(scene.parent(text), Ok(Some(rect)));
+
+        let missing = ElementId(9);
+        assert_eq!(
+            scene.description(missing),
+            Err(SceneError::Missing(missing))
+        );
+        assert_eq!(scene.parent(missing), Err(SceneError::Missing(missing)));
+        assert_eq!(
+            scene.set_description(missing, "x".into()),
+            Err(SceneError::Missing(missing))
+        );
+    }
+
+    #[test]
     fn serializes_as_a_tree() {
         let mut scene = Scene::default();
         let rect = scene.add_rect(None).unwrap();
+        scene.set_description(rect, "header".into()).unwrap();
         scene.add_text(Some(rect), "Hello".into()).unwrap();
         scene.add_rect(None).unwrap();
         assert_eq!(
@@ -273,7 +334,7 @@ mod tests {
             serde_json::json!({
                 "next_id": 4,
                 "elements": [
-                    {"id": 1, "rect": [{"id": 2, "text": "Hello"}]},
+                    {"id": 1, "desc": "header", "rect": [{"id": 2, "text": "Hello"}]},
                     {"id": 3, "rect": []},
                 ],
             })

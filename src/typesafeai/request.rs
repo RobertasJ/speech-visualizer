@@ -159,3 +159,59 @@ impl From<Score> for Question {
         Question::Score(score)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn serializes_each_kind_of_question() {
+        let request = Request::new(json!({"x": 1}))
+            .with_question("ready", Noul::new("Ready?").with_criteria("yes", "no"))
+            .with_question(
+                "route",
+                Choice::new("Where?").with_option("billing", "money"),
+            )
+            .with_question(
+                "urgency",
+                Score::new("How urgent?")
+                    .with_level("not")
+                    .with_level("very"),
+            );
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            json!({
+                "state": {"x": 1},
+                "model": "jev-latest",
+                "questions": {
+                    "ready": {
+                        "type": "noul",
+                        "instructions": "Ready?",
+                        "criteria": {"true": "yes", "false": "no"},
+                    },
+                    "route": {
+                        "type": "choice",
+                        "instructions": "Where?",
+                        "criteria": {"billing": "money"},
+                    },
+                    "urgency": {
+                        "type": "score",
+                        "instructions": "How urgent?",
+                        "criteria": ["not", "very"],
+                    },
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_noul_needs_no_criteria() {
+        let request = Request::new(()).with_question("ready", Noul::new("Ready?"));
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["questions"]["ready"],
+            json!({"type": "noul", "instructions": "Ready?"})
+        );
+    }
+}

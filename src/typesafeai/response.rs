@@ -136,3 +136,69 @@ where
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    fn response(answers: Value) -> Result<Response, serde_json::Error> {
+        serde_json::from_value(json!({
+            "model": "jev-latest",
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+            "answers": answers,
+        }))
+    }
+
+    #[test]
+    fn parses_each_kind_of_answer() {
+        let response = response(json!({
+            "ready": {"type": "noul", "noul": 0.75},
+            "route": {
+                "type": "choice",
+                "choice": "billing",
+                "probabilities": {"billing": 0.75, "general": 0.25},
+                "confidence": 0.5,
+            },
+            "urgency": {
+                "type": "score",
+                "score": 1.5,
+                "legend": {"1": "very", "0": "not"},
+                "probabilities": {"0": 0.25, "1": 0.75},
+                "confidence": 0.5,
+            },
+        }))
+        .unwrap();
+        assert_eq!(response.usage.input_tokens, 10);
+        assert_eq!(response.get_noul("ready"), 0.75);
+
+        let route = response.get_choice("route");
+        assert_eq!(route.choice(), "billing");
+        assert_eq!(route.probability("general"), Some(0.25));
+        assert_eq!(route.probability("other"), None);
+
+        // Levels come back in order, whatever order the map had them in.
+        let urgency = response.get_score("urgency");
+        assert_eq!(urgency.legends(), ["not", "very"]);
+        assert_eq!(urgency.probabilities(), [0.25, 0.75]);
+        assert_eq!(urgency.legend(1), Some("very"));
+    }
+
+    #[test]
+    fn score_levels_must_be_numbers_from_zero_without_gaps() {
+        let score = |legend: Value| {
+            response(json!({"s": {
+                "type": "score",
+                "score": 0.0,
+                "legend": legend,
+                "probabilities": {"0": 1.0},
+                "confidence": 1.0,
+            }}))
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(score(json!({"0": "a", "2": "c"})).contains("level 1 is missing"));
+        assert!(score(json!({"x": "a"})).contains("level `x` is not a number"));
+    }
+}

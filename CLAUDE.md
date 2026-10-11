@@ -1,8 +1,8 @@
 # speech-visualizer
 
 A Freya (0.5 rc) desktop app that transcribes the microphone with whisper.cpp
-(`whisper-rs`) and, in live mode, turns spoken commands into elements shown in a
-separate display window.
+(`whisper-rs`) and, in live mode, has an agent turn what's said into elements shown in a
+separate display window, by writing Rhai scripts.
 
 ## Working here
 
@@ -26,28 +26,50 @@ separate display window.
   - `stt/ui/`: the Freya side of it. `use_stt(on_event)` runs `run()` on a thread and
     calls `on_event` on the UI thread for each event, ending with `Event::Failed` if it
     errors. Also `Status` (for screens to show) and `Diagnostics`.
-- `scene.rs`: the element tree.
-  - `scene/command.rs` / `scene/names.rs`: parse and apply text commands to a scene;
-    names map words to element ids.
+- `scene.rs`: the element tree. Elements can have a description. It serializes for the
+  agent as a nested tree, with `next_id`.
+  - `scene/script.rs`: `Script` runs Rhai on a scene through a `Store` (for
+    `State<Scene>` in `scene/ui.rs`; for `Rc<RefCell<Scene>>` in tests). Variables last
+    between runs, a failed run is undone (the scene, and a deep copy of the variables),
+    and `fn`s only last for their run. Engine limits keep scripts from hanging the UI
+    thread.
+    - `script/api.rs`: the functions and the `Element` handle scripts use. Every use of
+      a removed element throws `no element <id>`. `print` and `debug` are registered for
+      elements so printing throws too: rhai's own show a failing `to_string` as just
+      the type name, which still happens in string interpolation, `+` and arrays.
+    - `script/table.rs`: `FUNCTIONS`, one line each, for the console's help and the
+      agent's prompt. Keep it in step with `api.rs`.
+    - `script/show.rs`: values as text, for results and `variables()`.
   - `scene/ui/`: `use_scene()` creates a scene owned by the calling component, and the
     display window (`display.rs`) lives as long as it does. `window.rs` has
     `spawn_window` / `WindowHandle`, a window that closes when its handle is dropped.
-- `live.rs`: `use_live(scene, names)` runs `use_stt`, and asks TypeSafe AI
-  (`typesafeai.rs`, `TYPESAFE_API_KEY`) about each final text: whether it asks for
-  anything new, and if the agent is running, whether it corrects that run. Text that
-  needs it starts one streaming rig agent (Anthropic, `ANTHROPIC_API_KEY`) with the
-  transcript, the new text, the scene, the names and all of its own previous responses
-  (with each command's outcome after it). A correction restarts a running agent;
-  otherwise it finishes and then runs again for the text. Each line it streams starting with `#` is run as a
-  command. Returns a `UseLive` handle with state for screens: `status()`,
-  `transcript()` / `live_text()`, and the agent's `responses()`, `writing()` (the
-  line in progress) and `thinking()`.
+- `live.rs`: live mode. `use_live(scene)` runs `use_stt` and wires the parts below; the
+  `UseLive` it returns hands their state to the screen.
+  - `live/transcript.rs`: what's been said, in numbered segments, each with its check.
+  - `live/check.rs`: asks TypeSafe AI (`typesafeai.rs`, `TYPESAFE_API_KEY`) whether a
+    segment asks for anything new and, if the agent is running, whether it corrects it.
+  - `live/schedule.rs`: what a checked segment does: start a run, restart the running
+    one (a correction), queue a rerun for when it finishes, or nothing.
+  - `live/agent.rs`: one run, on Anthropic through rig (`ANTHROPIC_API_KEY`; the model
+    and its thinking effort are consts at the top). The agent calls `run_script` and
+    gets each outcome and the scene back at once, until a reply makes no call.
+    `agent/input.rs` is its first message and system prompt (`agent/preamble.md`),
+    `agent/reply.rs` follows a streamed reply, `agent/tools.rs` is the tool.
+  - `live/history.rs`: what each run did; shown on screen, and sent back as text.
+  - `live/ui/`: `TranscriptPanel` and `ActivityPanel`, the live screen's debug view.
+- `typesafeai.rs`: the TypeSafe AI client, with Noul, Choice and Score questions.
 - `options.rs`: the choices made on the selection screen.
 - `ui/`: one component per screen (`Selection`, `Session`, `Console`, `LiveSession`)
   plus `NavBack`.
 - Each module's UI code goes in its own `ui/` subfolder. The modules re-export what
-  callers need (`scene::{Command, Names, use_scene}`, `stt::use_stt`).
-- Unit tests are inline at the bottom of their module, in `#[cfg(test)] mod tests`.
+  callers need (`scene::{FUNCTIONS, Outcome, Script, use_scene}`,
+  `live::{use_live, TranscriptPanel, ActivityPanel}`, `stt::use_stt`).
+- Unit tests are inline at the bottom of their module, in `#[cfg(test)] mod tests`, so
+  each part is tested on its own. Components are tested headlessly with
+  `freya-testing` (a dev-dependency): provide their state with
+  `provide_root_context`, call `use_init_theme`, and read labels with
+  `Label::try_downcast`. The glue in `live.rs` and the screens aren't tested, since
+  they need the mic, the models or the APIs.
   Modules use `foo.rs` + `foo/`, never `mod.rs`.
 
 ## Patterns
