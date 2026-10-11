@@ -1,8 +1,8 @@
 use freya::prelude::*;
 
 use super::nav_back::NavBack;
-use crate::scene::{self, ElementId, Names, Scene, use_scene};
 use crate::live::use_live;
+use crate::scene::{self, ElementId, Names, Scene, use_scene};
 
 #[derive(PartialEq)]
 pub struct LiveSession;
@@ -12,6 +12,26 @@ impl Component for LiveSession {
         let scene = use_scene();
         let names = use_state(Names::default);
         let live = use_live(scene, names);
+
+        // Both stay scrolled to the end as text comes in.
+        let mut transcript_scroll = use_scroll_controller(|| ScrollConfig {
+            default_vertical_position: ScrollPosition::End,
+            ..Default::default()
+        });
+        let mut agent_scroll = use_scroll_controller(|| ScrollConfig {
+            default_vertical_position: ScrollPosition::End,
+            ..Default::default()
+        });
+        use_side_effect(move || {
+            live.transcript().read();
+            live.live_text().read();
+            transcript_scroll.scroll_to(ScrollPosition::End, Direction::Vertical);
+        });
+        use_side_effect(move || {
+            live.responses().read();
+            live.writing().read();
+            agent_scroll.scroll_to(ScrollPosition::End, Direction::Vertical);
+        });
 
         let colors = use_theme().read().colors.clone();
 
@@ -32,6 +52,33 @@ impl Component for LiveSession {
                     .color(colors.text_secondary),
             );
 
+        let transcript = live.transcript().read().clone();
+        let live_text = live.live_text().read().clone();
+        let transcript = if transcript.is_empty() && live_text.is_empty() {
+            paragraph().span(Span::new("Say something.").color(colors.text_secondary))
+        } else {
+            let sep = if transcript.is_empty() { "" } else { " " };
+            paragraph()
+                .width(Size::fill())
+                .span(Span::new(transcript))
+                .span(
+                    Span::new(format!("{sep}{live_text}"))
+                        .color(colors.text_secondary)
+                        .font_slant(FontSlant::Italic),
+                )
+        };
+
+        let agent_heading = label()
+            .padding((8., 16., 4., 16.))
+            .font_size(13.)
+            .color(colors.text_secondary)
+            .text(if *live.thinking().read() {
+                "Agent · thinking…"
+            } else {
+                "Agent"
+            });
+        let agent_output = agent_output(&live.responses().read(), &live.writing().read(), &colors);
+
         let rows = outline(&scene.read(), &names.read());
         let body = if rows.is_empty() {
             rect().padding(16.).child(
@@ -48,12 +95,72 @@ impl Component for LiveSession {
             .content(Content::Flex)
             .child(top_bar)
             .child(
+                ScrollView::new_controlled(transcript_scroll)
+                    .width(Size::fill())
+                    .height(Size::px(96.))
+                    .child(rect().padding((8., 16.)).child(transcript)),
+            )
+            .child(agent_heading)
+            .child(
+                ScrollView::new_controlled(agent_scroll)
+                    .width(Size::fill())
+                    .height(Size::px(160.))
+                    .child(
+                        rect()
+                            .padding((0., 16., 8., 16.))
+                            .spacing(8.)
+                            .children(agent_output),
+                    ),
+            )
+            .child(
                 ScrollView::new()
                     .width(Size::fill())
                     .height(Size::flex(1.))
                     .child(body),
             )
     }
+}
+
+/// The agent's responses, one block each, with the line it's writing at the end of the
+/// last. Commands are in the normal color, how they went is dimmed (red if they
+/// failed), and its reasoning is dimmed and in italics.
+fn agent_output(responses: &[String], writing: &str, colors: &ColorsSheet) -> Vec<Element> {
+    let last = responses.len().saturating_sub(1);
+    responses
+        .iter()
+        .enumerate()
+        .filter(|&(i, response)| !response.is_empty() || (i == last && !writing.is_empty()))
+        .map(|(i, response)| {
+            let lines = response.lines().enumerate().map(|(j, line)| {
+                let label = label().key(j).font_size(14.).text(line.to_owned());
+                if line.starts_with("> failed") {
+                    label.color(colors.error)
+                } else if line.starts_with('>') {
+                    label.color(colors.text_secondary)
+                } else if line.trim_start().starts_with('#') {
+                    label
+                } else {
+                    label
+                        .color(colors.text_secondary)
+                        .font_slant(FontSlant::Italic)
+                }
+                .into_element()
+            });
+            let writing = (i == last && !writing.is_empty()).then(|| {
+                label()
+                    .key("writing")
+                    .font_size(14.)
+                    .color(colors.text_secondary)
+                    .text(writing.to_owned())
+                    .into_element()
+            });
+            rect()
+                .key(i)
+                .spacing(2.)
+                .children(lines.chain(writing))
+                .into_element()
+        })
+        .collect()
 }
 
 fn outline(scene: &Scene, names: &Names) -> Vec<Element> {

@@ -8,13 +8,16 @@ mod ui;
 use std::collections::HashMap;
 use std::fmt;
 
+use serde::Serialize;
+use serde::ser::{SerializeMap, Serializer};
+
 pub use command::Command;
 pub use names::Names;
 pub use ui::use_scene;
 
 /// Identifies an element. Assigned by the [`Scene`] when the element is added, and
 /// never reused, even after the element is removed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct ElementId(pub u64);
 
 impl fmt::Display for ElementId {
@@ -148,6 +151,51 @@ impl Scene {
     }
 }
 
+/// Serializes as the tree it is, for reading: the id the next element will get, and
+/// the top-level elements in order, each with its id and a rect with its children:
+///
+/// ```json
+/// {"next_id": 3, "elements": [{"id": 1, "rect": [{"id": 2, "text": "Hello"}]}]}
+/// ```
+impl Serialize for Scene {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("next_id", &(self.last_id + 1))?;
+        map.serialize_entry("elements", &Nodes(self, &self.roots))?;
+        map.end()
+    }
+}
+
+/// Elements of a scene, serialized as a list of trees.
+struct Nodes<'a>(&'a Scene, &'a [ElementId]);
+
+impl Serialize for Nodes<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Nodes(scene, ids) = *self;
+        serializer.collect_seq(ids.iter().map(|&id| Node(scene, id)))
+    }
+}
+
+/// An element of a scene, serialized with its id, and its children if it's a rect.
+struct Node<'a>(&'a Scene, ElementId);
+
+impl Serialize for Node<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Node(scene, id) = *self;
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("id", &id)?;
+        match scene.get(id) {
+            Some(Element::Rect { children }) => {
+                map.serialize_entry("rect", &Nodes(scene, children))?
+            }
+            Some(Element::Text { text }) => map.serialize_entry("text", text)?,
+            // Children and roots only list elements that exist.
+            None => {}
+        }
+        map.end()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +260,23 @@ mod tests {
             Err(SceneError::Missing(ElementId(9)))
         );
         assert_eq!(scene, before);
+    }
+
+    #[test]
+    fn serializes_as_a_tree() {
+        let mut scene = Scene::default();
+        let rect = scene.add_rect(None).unwrap();
+        scene.add_text(Some(rect), "Hello".into()).unwrap();
+        scene.add_rect(None).unwrap();
+        assert_eq!(
+            serde_json::to_value(&scene).unwrap(),
+            serde_json::json!({
+                "next_id": 4,
+                "elements": [
+                    {"id": 1, "rect": [{"id": 2, "text": "Hello"}]},
+                    {"id": 3, "rect": []},
+                ],
+            })
+        );
     }
 }

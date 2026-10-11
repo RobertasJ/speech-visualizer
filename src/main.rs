@@ -2,7 +2,7 @@ mod live;
 mod options;
 mod scene;
 mod stt;
-// Not wired into the app yet.
+// Only `Noul` questions are used so far, by live.rs.
 #[allow(dead_code)]
 mod typesafeai;
 mod ui;

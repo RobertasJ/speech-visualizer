@@ -14,11 +14,17 @@ pub enum Target {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    /// Adds an empty rect at the end of `parent`'s children, or of the top level.
-    AddRect { parent: Option<Target> },
-    /// Adds text at the end of `parent`'s children, or of the top level.
+    /// Adds an empty rect at the end of `parent`'s children, or of the top level, and
+    /// puts `name` on it.
+    AddRect {
+        parent: Option<Target>,
+        name: Option<String>,
+    },
+    /// Adds text at the end of `parent`'s children, or of the top level, and puts `name`
+    /// on it.
     AddText {
         parent: Option<Target>,
+        name: Option<String>,
         text: String,
     },
     /// Replaces the text of a text element.
@@ -53,13 +59,15 @@ impl Command {
     ) -> Result<Option<ElementId>, CommandError> {
         // Targets are resolved before anything changes, so an unknown name changes nothing.
         match self {
-            Command::AddRect { parent } => {
+            Command::AddRect { parent, name } => {
                 let parent = parent.map(|parent| resolve(names, &parent)).transpose()?;
-                Ok(Some(scene.add_rect(parent)?))
+                let id = scene.add_rect(parent)?;
+                Ok(Some(named(names, id, name)))
             }
-            Command::AddText { parent, text } => {
+            Command::AddText { parent, name, text } => {
                 let parent = parent.map(|parent| resolve(names, &parent)).transpose()?;
-                Ok(Some(scene.add_text(parent, text)?))
+                let id = scene.add_text(parent, text)?;
+                Ok(Some(named(names, id, name)))
             }
             Command::SetText { id, text } => {
                 scene.set_text(resolve(names, &id)?, text)?;
@@ -104,8 +112,8 @@ impl FromStr for Command {
     /// Parses a typed command:
     ///
     /// ```text
-    /// rect [in <id>]        (or rectangle)
-    /// text [in <id>] <text>
+    /// rect [in <id>] [as <name>]          (or rectangle)
+    /// text [in <id>] [as <name>] <text>
     /// set <id> <text>
     /// remove <id>
     /// name <id> <name>
@@ -115,19 +123,22 @@ impl FromStr for Command {
     /// ```
     ///
     /// A name works wherever an `<id>` does, and ids up to ten have their word as a
-    /// name, so "three" is element 3.
+    /// name, so "three" is element 3. `as <name>` names the element being added.
     fn from_str(line: &str) -> Result<Self, String> {
         let (word, rest) = split_word(line);
         let command = match word {
             "rect" | "rectangle" => {
                 let (parent, rest) = parse_parent(rest)?;
+                let (name, rest) = parse_as(rest)?;
                 expect_end(rest)?;
-                Command::AddRect { parent }
+                Command::AddRect { parent, name }
             }
             "text" => {
-                let (parent, text) = parse_parent(rest)?;
+                let (parent, rest) = parse_parent(rest)?;
+                let (name, text) = parse_as(rest)?;
                 Command::AddText {
                     parent,
+                    name,
                     text: text.to_owned(),
                 }
             }
@@ -147,13 +158,10 @@ impl FromStr for Command {
                 let (target, rest) = parse_target(rest)?;
                 let (name, rest) = split_word(rest);
                 expect_end(rest)?;
-                let name = parse_name(name)?;
-                // Reserved so commands stay unambiguous: "in" starts a parent, "number"
-                // comes before an id or name, and "unname all" removes every name.
-                if matches!(name.as_str(), "in" | "number" | "all") {
-                    return Err(format!("'{name}' can't be a name"));
+                Command::Name {
+                    target,
+                    name: parse_new_name(name)?,
                 }
-                Command::Name { target, name }
             }
             "unname" => {
                 let (name, rest) = split_word(rest);
@@ -188,6 +196,14 @@ fn resolve(names: &Names, target: &Target) -> Result<ElementId, CommandError> {
             .get(name)
             .ok_or_else(|| CommandError::UnknownName(name.to_lowercase())),
     }
+}
+
+/// Puts `name`, if any, on the element `id` that was just added.
+fn named(names: &mut Names, id: ElementId, name: Option<String>) -> ElementId {
+    if let Some(name) = name {
+        names.insert(&name, id);
+    }
+    id
 }
 
 fn split_word(text: &str) -> (&str, &str) {
@@ -231,6 +247,28 @@ fn parse_name(word: &str) -> Result<String, String> {
     Ok(word.to_lowercase())
 }
 
+/// A name to put on an element.
+fn parse_new_name(word: &str) -> Result<String, String> {
+    let name = parse_name(word)?;
+    // Reserved so commands stay unambiguous: "in" starts a parent, "as" a new element's
+    // name, "number" comes before an id or name, and "unname all" removes every name.
+    if matches!(name.as_str(), "in" | "as" | "number" | "all") {
+        return Err(format!("'{name}' can't be a name"));
+    }
+    Ok(name)
+}
+
+/// An optional "as <name>", naming an element being added.
+fn parse_as(text: &str) -> Result<(Option<String>, &str), String> {
+    match split_word(text) {
+        ("as", rest) => {
+            let (name, rest) = split_word(rest);
+            Ok((Some(parse_new_name(name)?), rest))
+        }
+        _ => Ok((None, text)),
+    }
+}
+
 fn expect_end(rest: &str) -> Result<(), String> {
     if rest.is_empty() {
         Ok(())
@@ -260,7 +298,8 @@ mod tests {
         assert_eq!(
             "rectangle in 2".parse::<Command>(),
             Ok(Command::AddRect {
-                parent: Some(Target::Id(ElementId(2)))
+                parent: Some(Target::Id(ElementId(2))),
+                name: None,
             })
         );
     }
@@ -291,6 +330,7 @@ mod tests {
             "text in number two hi".parse::<Command>(),
             Ok(Command::AddText {
                 parent: Some(Target::Name("two".into())),
+                name: None,
                 text: "hi".into()
             })
         );
@@ -429,6 +469,46 @@ mod tests {
         assert_eq!(
             run(&mut world, "name 9 box"),
             Err(CommandError::Scene(SceneError::Missing(ElementId(9))))
+        );
+        assert_eq!(world, before);
+    }
+
+    #[test]
+    fn as_names_the_added_element() {
+        assert_eq!(
+            "text in 1 as Title Hello there".parse::<Command>(),
+            Ok(Command::AddText {
+                parent: Some(Target::Id(ElementId(1))),
+                name: Some("title".into()),
+                text: "Hello there".into()
+            })
+        );
+        let mut world = World::default();
+        assert_eq!(run(&mut world, "rect as box"), Ok(Some(ElementId(1))));
+        assert_eq!(
+            run(&mut world, "text in box as title hi"),
+            Ok(Some(ElementId(2)))
+        );
+        assert_eq!(world.names.of(ElementId(1)), ["box", "one"]);
+        assert_eq!(world.names.of(ElementId(2)), ["title", "two"]);
+    }
+
+    #[test]
+    fn as_needs_a_usable_name() {
+        assert!("rect as".parse::<Command>().is_err());
+        assert!("rect as 3".parse::<Command>().is_err());
+        assert!("rect as in".parse::<Command>().is_err());
+        assert!("rect as box lid".parse::<Command>().is_err());
+        assert!("name 1 as".parse::<Command>().is_err());
+    }
+
+    #[test]
+    fn a_failed_add_doesnt_name() {
+        let mut world = World::default();
+        let before = world.clone();
+        assert_eq!(
+            run(&mut world, "rect in 5 as box"),
+            Err(CommandError::Scene(SceneError::Missing(ElementId(5))))
         );
         assert_eq!(world, before);
     }

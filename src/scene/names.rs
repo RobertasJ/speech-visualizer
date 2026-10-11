@@ -2,12 +2,14 @@
 
 use std::collections::HashMap;
 
+use serde::Serialize;
+
 use super::ElementId;
 
 /// Lowercase names and the elements they're on. Starts out as [`number_names`], so a
 /// name can be on an element that doesn't exist yet. Kept apart from the scene, so it
 /// isn't told about removed elements: [`forget`](Self::forget) their ids.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Names(HashMap<String, ElementId>);
 
 impl Default for Names {

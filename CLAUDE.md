@@ -32,8 +32,15 @@ separate display window.
   - `scene/ui/`: `use_scene()` creates a scene owned by the calling component, and the
     display window (`display.rs`) lives as long as it does. `window.rs` has
     `spawn_window` / `WindowHandle`, a window that closes when its handle is dropped.
-- `live.rs`: `use_live(scene, names)` runs `use_stt` and turns final transcription text
-  into commands for the scene. Returns a `UseLive` handle (`status()` for screens).
+- `live.rs`: `use_live(scene, names)` runs `use_stt`, and on each final text starts
+  one streaming rig agent (Anthropic, `ANTHROPIC_API_KEY`) with the transcript, the new
+  text, the scene, the names and all of its own previous responses (with each
+  command's outcome after it). If one is already running, TypeSafe AI
+  (`typesafeai.rs`, `TYPESAFE_API_KEY`) is asked whether the text is a correction:
+  if so the agent restarts, otherwise it finishes and then runs again for the text. Each line it streams starting with `#` is run as a
+  command. Returns a `UseLive` handle with state for screens: `status()`,
+  `transcript()` / `live_text()`, and the agent's `responses()`, `writing()` (the
+  line in progress) and `thinking()`.
 - `options.rs`: the choices made on the selection screen.
 - `ui/`: one component per screen (`Selection`, `Session`, `Console`, `LiveSession`)
   plus `NavBack`.

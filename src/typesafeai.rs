@@ -3,7 +3,7 @@ mod response;
 
 use reqwest::{Client, StatusCode};
 
-use request::Request;
+pub use request::{Noul, Request};
 use response::Response;
 
 #[derive(Debug, thiserror::Error)]

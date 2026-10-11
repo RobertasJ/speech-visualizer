@@ -53,7 +53,7 @@ impl Component for Console {
             .font_size(13.)
             .color(colors.text_secondary)
             .text(
-                "rect(angle) [in <id>]  ·  text [in <id>] <text>  ·  set <id> <text>  ·  remove <id>  ·  name <id> <name>  ·  unname <name>  ·  unname all  ·  clear  —  a name works wherever an <id> does",
+                "rect(angle) [in <id>] [as <name>]  ·  text [in <id>] [as <name>] <text>  ·  set <id> <text>  ·  remove <id>  ·  name <id> <name>  ·  unname <name>  ·  unname all  ·  clear  —  a name works wherever an <id> does",
             );
 
         let log =
