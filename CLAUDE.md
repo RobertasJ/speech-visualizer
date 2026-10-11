@@ -66,7 +66,8 @@ separate display window, by writing Rhai scripts.
   `UseLive` it returns hands their state to the screen.
   - `live/transcript.rs`: what's been said, in numbered segments, each with its check.
   - `live/check.rs`: asks TypeSafe AI (`typesafeai.rs`, `TYPESAFE_API_KEY`) whether a
-    segment asks for anything new and, if the agent is running, whether it corrects it.
+    segment asks for anything new and, if the agent is running, whether it corrects it,
+    given only the last few sentences said before it.
   - `live/schedule.rs`: what a checked segment does: start a run, restart the running
     one (a correction), queue a rerun for when it finishes, or nothing.
   - `live/agent.rs`: one run, on Anthropic through rig (`ANTHROPIC_API_KEY`; the model

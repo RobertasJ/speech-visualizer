@@ -5,19 +5,30 @@ use serde_json::json;
 
 use crate::typesafeai::{self, Noul, Request};
 
-/// How likely a yes has to be to count.
-const THRESHOLD: f32 = 0.5;
+/// How likely a yes has to be to count, for each question. Missing a request is worse
+/// than running the agent for nothing, but a wrong correction cancels a run.
+const NEW_THRESHOLD: f32 = 0.3;
+const CORRECTION_THRESHOLD: f32 = 0.5;
+
+/// How many sentences of what was said before a segment its check is given. More
+/// makes requests read as asked for already.
+const EARLIER_SENTENCES: usize = 3;
 
 /// The question asking whether a segment asks for anything new.
 const NEW: &str = "new";
-const NEW_QUESTION: &str = "Someone is speaking to an assistant that changes what a \
-    display shows. `earlier` is what they said before `new_text`, and `acting_on` is \
-    what the assistant is carrying out right now, if anything. Does `new_text` ask for \
-    anything to be done to the display that hasn't been asked for already?";
-const NEW_YES: &str = "It asks for something to be added, changed, named, removed or \
-    cleared, or corrects or takes back something asked for, even in passing.";
-const NEW_NO: &str = "It's filler, thinking out loud, talk not meant for the assistant, \
-    or only repeats what was already asked for.";
+const NEW_QUESTION: &str = "Someone is talking, and an assistant listens and changes \
+    what a display shows for them. `new_text` is what they just said, `earlier` is the \
+    few sentences before it, and `acting_on` is what the assistant is working on right \
+    now, if anything. Does `new_text` want anything shown on the display or changed on \
+    it, beyond what `acting_on` already does?";
+const NEW_YES: &str = "It asks, however indirectly, politely or vaguely, for something \
+    to be shown, added, changed, moved, removed or cleared, like \"show me…\", \"can \
+    you…\", \"I need…\", \"help me with…\" or \"what about…\", or asks a question \
+    the display could answer, or corrects or takes back something asked for. Asking \
+    again for something said `earlier` counts, since it may not have been done. When \
+    unsure, yes.";
+const NEW_NO: &str = "It's only filler or a fragment with no request in it, talk \
+    plainly not meant for the assistant, or only repeats what `acting_on` already does.";
 
 /// The question asking whether a segment corrects what the agent is doing.
 const CORRECTION: &str = "correction";
@@ -43,13 +54,13 @@ pub struct Verdict {
 impl Verdict {
     /// Whether it needs the agent: it asks for something new, or corrects it.
     pub fn needs_agent(&self) -> bool {
-        self.new > THRESHOLD || self.corrects()
+        self.new > NEW_THRESHOLD || self.corrects()
     }
 
     /// Whether it corrects what the running agent is doing.
     pub fn corrects(&self) -> bool {
         self.correction
-            .is_some_and(|correction| correction > THRESHOLD)
+            .is_some_and(|correction| correction > CORRECTION_THRESHOLD)
     }
 }
 
@@ -67,12 +78,12 @@ pub struct Check {
 }
 
 impl Check {
-    /// A check of `text`, given what was said `earlier` and what the running agent is
-    /// `acting_on`, if one is running. `earlier` mustn't include `text`, or it reads as
-    /// asked for already.
+    /// A check of `text`, given what was said `earlier` (only its last few sentences are
+    /// sent) and what the running agent is `acting_on`, if one is running. `earlier`
+    /// mustn't include `text`, or it reads as asked for already.
     pub fn new(earlier: &str, acting_on: Option<&str>, text: &str) -> Self {
         let state = json!({
-            "earlier": earlier,
+            "earlier": last_sentences(earlier, EARLIER_SENTENCES),
             "acting_on": acting_on,
             "new_text": text,
         });
@@ -96,6 +107,24 @@ impl Check {
             new: response.get_noul(NEW),
             correction: self.asks_correction.then(|| response.get_noul(CORRECTION)),
         })
+    }
+}
+
+/// The last `count` sentences of `text`, or all of it if it has no more. A sentence
+/// ends at a `.`, `!` or `?` followed by a space.
+fn last_sentences(text: &str, count: usize) -> &str {
+    let text = text.trim();
+    // Where each sentence but the first starts.
+    let starts: Vec<usize> = text
+        .char_indices()
+        .zip(text.chars().skip(1))
+        .filter(|&((_, mark), next)| matches!(mark, '.' | '!' | '?') && next.is_whitespace())
+        .map(|((at, mark), _)| at + mark.len_utf8())
+        .collect();
+    match starts.len().checked_sub(count) {
+        Some(skipped) if count > 0 => text[starts[skipped]..].trim_start(),
+        Some(_) => "",
+        None => text,
     }
 }
 
@@ -139,11 +168,34 @@ mod tests {
         let verdict = |new, correction| Verdict { new, correction };
         assert!(verdict(0.97, None).needs_agent());
         assert!(!verdict(0.04, None).needs_agent());
-        assert!(!verdict(0.5, None).needs_agent());
+        assert!(verdict(0.35, None).needs_agent());
+        assert!(!verdict(0.3, None).needs_agent());
         // A correction needs the agent, whatever the other answer said.
         assert!(verdict(0.2, Some(0.9)).needs_agent());
         assert!(verdict(0.2, Some(0.9)).corrects());
         assert!(!verdict(0.9, Some(0.1)).corrects());
+        assert!(!verdict(0.9, Some(0.5)).corrects());
         assert!(!verdict(0.9, None).corrects());
+    }
+
+    #[test]
+    fn checks_get_the_last_few_sentences_said_before() {
+        let said = "First one. Second one! Third one? Fourth one... and fifth";
+        assert_eq!(
+            last_sentences(said, 3),
+            "Third one? Fourth one... and fifth"
+        );
+        assert_eq!(last_sentences(said, 5), said);
+        assert_eq!(last_sentences(said, 9), said);
+        assert_eq!(last_sentences(" no marks at all ", 2), "no marks at all");
+        assert_eq!(last_sentences("Ends here. ", 1), "Ends here.");
+        assert_eq!(last_sentences("a. b. c.", 0), "");
+        assert_eq!(last_sentences("", 3), "");
+
+        let check = Check::new(said, None, "show it");
+        assert_eq!(
+            sent(&check)["state"]["earlier"],
+            "Third one? Fourth one... and fifth"
+        );
     }
 }
