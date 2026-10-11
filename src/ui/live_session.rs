@@ -68,15 +68,22 @@ impl Component for LiveSession {
                 )
         };
 
+        let mut activity = vec!["Agent".to_owned()];
+        if *live.thinking().read() {
+            activity.push("thinking…".into());
+        }
+        if *live.checking().read() > 0 {
+            activity.push("checking what was said…".into());
+        }
+        let queued = *live.queued().read();
+        if queued > 0 {
+            activity.push(format!("{queued} more queued"));
+        }
         let agent_heading = label()
             .padding((8., 16., 4., 16.))
             .font_size(13.)
             .color(colors.text_secondary)
-            .text(if *live.thinking().read() {
-                "Agent · thinking…"
-            } else {
-                "Agent"
-            });
+            .text(activity.join(" · "));
         let agent_output = agent_output(&live.responses().read(), &live.writing().read(), &colors);
 
         let rows = outline(&scene.read(), &names.read());

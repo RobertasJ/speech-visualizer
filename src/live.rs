@@ -12,10 +12,14 @@ use crate::typesafeai::{self, Noul, Request};
 
 const MODEL: &str = anthropic::completion::CLAUDE_SONNET_5_5;
 
+/// The TypeSafe AI question asking whether new text needs the agent at all.
+const NEW: &str = "new";
 /// The TypeSafe AI question asking whether new text corrects what the agent is doing.
 const CORRECTION: &str = "correction";
-/// How likely a correction has to be for the running agent to be restarted.
-const CORRECTION_THRESHOLD: f32 = 0.5;
+/// How likely a yes from TypeSafe AI has to be to count.
+const THRESHOLD: f32 = 0.5;
+/// Ends the response of a run that was cancelled. Only a correction cancels one.
+const CANCELLED: &str = "> cancelled: new speech corrected this\n";
 
 /// Transcribes the microphone for as long as the component is mounted, and has an
 /// agent turn what is said into changes to `scene`.
@@ -28,9 +32,14 @@ pub fn use_live(scene: State<Scene>, names: State<Names>) -> UseLive {
         live_text: use_state(String::new),
         new_text: use_state(String::new),
         acting_on: use_state(|| 0),
+        received: use_state(|| 0),
+        given: use_state(|| 0),
+        wanted: use_state(|| 0),
         responses: use_state(Vec::new),
         writing: use_state(String::new),
         thinking: use_state(|| false),
+        checking: use_state(|| 0),
+        queued: use_state(|| 0),
         model: use_state(|| match Anthropic::from_env() {
             Ok(provider) => Some(provider.completion(MODEL)),
             Err(err) => {
@@ -60,6 +69,13 @@ pub struct UseLive {
     /// How much of `new_text` the current or latest run was given; the rest came in
     /// while it was running.
     acting_on: State<usize>,
+    /// How many texts have been added to `new_text`, so also the next one's number.
+    received: State<u64>,
+    /// How many texts the current or latest run was given: those numbered below it.
+    given: State<u64>,
+    /// One more than the number of the latest text that needs the agent, or 0. The
+    /// agent runs again when it's done if this is more than `given`.
+    wanted: State<u64>,
     /// Every response of the agent, one per run, as it wrote them, with a `> ` line
     /// after each command saying how it went. A cancelled run's ends early.
     responses: State<Vec<String>>,
@@ -67,6 +83,11 @@ pub struct UseLive {
     writing: State<String>,
     /// Whether the agent is running.
     thinking: State<bool>,
+    /// How many texts are waiting on TypeSafe AI to say whether they need the agent.
+    checking: State<usize>,
+    /// How many texts that need the agent came in while the current run was going. It
+    /// runs again for them when it's done.
+    queued: State<usize>,
     /// None if the API key isn't set.
     model: State<Option<Model<Messages>>>,
     /// The running agent; at most one at a time.
@@ -105,6 +126,17 @@ impl UseLive {
         self.thinking
     }
 
+    /// How many texts are being checked for whether they need the agent.
+    pub fn checking(&self) -> State<usize> {
+        self.checking
+    }
+
+    /// How many texts that need the agent came in while it was running, for its next
+    /// run.
+    pub fn queued(&self) -> State<usize> {
+        self.queued
+    }
+
     /// Called for every transcription event, in order: work out what the display should
     /// show and send commands for it.
     fn on_event(&mut self, event: Event) {
@@ -113,7 +145,7 @@ impl UseLive {
             Event::Failed(err) => self.status.set(Status::Failed(err)),
             // The open section's text so far; it may still change.
             Event::Live { text, .. } => self.live_text.set(text),
-            // Text that won't change anymore: have the agent act on it.
+            // Text that won't change anymore: have the agent act on it if it needs to.
             Event::Final { text, .. } => {
                 self.live_text.set(String::new());
                 if text.is_empty() {
@@ -126,55 +158,131 @@ impl UseLive {
                     }
                     joined.push_str(&text);
                 }
-                let running = *self.agent.peek();
-                match running {
-                    None => self.start_agent(),
-                    // Restarted if this corrects what it's doing. Otherwise it finishes,
-                    // then runs again for this text.
-                    Some(running) => self.check_correction(text, running),
-                }
+                let number = *self.received.peek();
+                self.received.set(number + 1);
+                self.check_text(text, number);
             }
             Event::Error(_) => {}
         }
     }
 
-    /// Asks TypeSafe AI whether `text` corrects what the `running` agent is acting on,
-    /// and if it does, restarts the agent, as long as that run is still going.
-    fn check_correction(&self, text: String, running: TaskHandle) {
+    /// Asks TypeSafe AI whether text number `number` asks for anything new, and if the
+    /// agent is running, whether it corrects what that run is acting on. Then has the
+    /// agent act on it if it needs to.
+    fn check_text(&mut self, text: String, number: u64) {
+        let running = *self.agent.peek();
         let new_text = self.new_text.peek();
-        let request = Request::new(json!({
-            "transcript": *self.transcript.peek(),
-            "acting_on": new_text[..*self.acting_on.peek()],
+        let acting_on = running.map(|_| &new_text[..*self.acting_on.peek()]);
+        // Without `text`: given the whole transcript, it reads `text` as already asked for.
+        let transcript = self.transcript.peek();
+        let earlier = transcript[..transcript.len() - text.len()].trim_end();
+        let mut request = Request::new(json!({
+            "earlier": earlier,
+            "acting_on": acting_on,
             "new_text": text,
         }))
         .with_question(
-            CORRECTION,
+            NEW,
             Noul::new(
-                "Someone is speaking commands that change what a display shows, and an \
-                 assistant is carrying out `acting_on`. Does `new_text` correct it, \
-                 rather than asking for something more?",
+                "Someone is speaking to an assistant that changes what a display shows. \
+                 `earlier` is what they said before `new_text`, and `acting_on` is what \
+                 the assistant is carrying out right now, if anything. Does `new_text` ask for anything to be done to the display that hasn't \
+                 been asked for already?",
             )
             .with_criteria(
-                "It changes, fixes or takes back what `acting_on` asks for, like \
-                 \"no, the other box\", \"I meant blue\" or \"wait, not that\", or \
-                 fixes a word in it that was misheard.",
-                "It asks for something new, adds to what `acting_on` asks for, or \
-                 isn't a request at all.",
+                "It asks for something to be added, changed, named, removed or cleared, \
+                 or corrects or takes back something asked for, even in passing.",
+                "It's filler, thinking out loud, talk not meant for the assistant, or \
+                 only repeats what was already asked for.",
             ),
         );
-        drop(new_text);
+        if running.is_some() {
+            request = request.with_question(
+                CORRECTION,
+                Noul::new(
+                    "Someone is speaking commands that change what a display shows, and \
+                     an assistant is carrying out `acting_on`. `earlier` is what they \
+                     said before `new_text`. Does `new_text` correct it, rather than \
+                     asking for something more?",
+                )
+                .with_criteria(
+                    "It changes, fixes or takes back what `acting_on` asks for, like \
+                     \"no, the other box\", \"I meant blue\" or \"wait, not that\", \
+                     or fixes a word in it that was misheard.",
+                    "It asks for something new, adds to what `acting_on` asks for, or \
+                     isn't a request at all.",
+                ),
+            );
+        }
+        drop((new_text, transcript));
 
+        *self.checking.write() += 1;
         let mut live = *self;
         spawn(async move {
-            let correction = match typesafeai::send(&request).await {
-                Ok(response) => response.get_noul(CORRECTION),
-                Err(err) => return eprintln!("[correction] {err}"),
+            let response = typesafeai::send(&request).await;
+            *live.checking.write() -= 1;
+            let scores = match response {
+                Ok(response) => {
+                    let correction = running.map(|_| response.get_noul(CORRECTION));
+                    Some((response.get_noul(NEW), correction))
+                }
+                Err(err) => {
+                    eprintln!("[check] {err}");
+                    None
+                }
             };
-            let still_running = *live.agent.peek() == Some(running);
-            if correction > CORRECTION_THRESHOLD && still_running {
-                live.start_agent();
-            }
+            // Better to run the agent for nothing than to miss a request.
+            let (new, correction) = scores.unwrap_or((1., None));
+            let correction = correction.is_some_and(|correction| correction > THRESHOLD);
+            let outcome = if new > THRESHOLD || correction {
+                live.act_on(number, running, correction)
+            } else {
+                "ignored"
+            };
+
+            let scores = match scores {
+                Some((new, Some(correction))) => {
+                    format!("new {new:.2}, correction {correction:.2}")
+                }
+                Some((new, None)) => format!("new {new:.2}"),
+                None => "check failed".to_owned(),
+            };
+            eprintln!("[check] {text:?}: {scores} -> {outcome}");
         });
+    }
+
+    /// Has the agent act on text number `number`, which needs it. A correction of the
+    /// run that was going when it came in restarts that run, if it still is. Otherwise
+    /// a running agent finishes first, then runs again for it.
+    /// Returns what it did, for the log.
+    fn act_on(
+        &mut self,
+        number: u64,
+        during: Option<TaskHandle>,
+        correction: bool,
+    ) -> &'static str {
+        // A run that started after it came in was given it already.
+        if number < *self.given.peek() {
+            return "already given";
+        }
+        let wanted = (*self.wanted.peek()).max(number + 1);
+        self.wanted.set(wanted);
+
+        let running = *self.agent.peek();
+        match running {
+            None => {
+                self.start_agent();
+                "started"
+            }
+            Some(_) if correction && running == during => {
+                self.start_agent();
+                "restarted"
+            }
+            Some(_) => {
+                *self.queued.write() += 1;
+                "queued"
+            }
+        }
     }
 
     /// Cancels the running agent, if any, and starts one on the current transcript,
@@ -182,6 +290,9 @@ impl UseLive {
     fn start_agent(&mut self) {
         if let Some(agent) = self.agent.write().take() {
             agent.cancel();
+            if let Some(response) = self.responses.write().last_mut() {
+                response.push_str(CANCELLED);
+            }
         }
         let Some(model) = self.model.peek().clone() else {
             return;
@@ -198,6 +309,9 @@ impl UseLive {
 
         let acting_on = self.new_text.peek().len();
         self.acting_on.set(acting_on);
+        let received = *self.received.peek();
+        self.given.set(received);
+        self.queued.set(0);
         self.responses.write().push(String::new());
         self.writing.set(String::new());
         self.thinking.set(true);
@@ -214,8 +328,8 @@ impl UseLive {
         self.agent.set(Some(agent));
     }
 
-    /// Drops the text the finished run acted on, and runs again for any that came in
-    /// while it was running.
+    /// Drops the text the finished run acted on, and runs again if any that came in
+    /// while it was running needs it. The rest stays, as context for the next run.
     fn finish_run(&mut self) {
         let acting_on = *self.acting_on.peek();
         let mut new_text = self.new_text.write();
@@ -224,9 +338,8 @@ impl UseLive {
         if new_text.starts_with(' ') {
             new_text.remove(0);
         }
-        let more = !new_text.is_empty();
         drop(new_text);
-        if more {
+        if *self.wanted.peek() > *self.given.peek() {
             self.start_agent();
         }
     }
@@ -303,7 +416,7 @@ Each message is a JSON object:
 
 - `transcript`: everything said so far, as recognized. It ends with `new_text`.
 - `new_text`: what was said since you last finished acting on the speech. Act on this; use the rest of the transcript only to understand it, such as what "it" or "that box" refers to.
-- `responses`: your previous replies, oldest first, as you wrote them. After each command is a line starting with `>` that says how it went: `> added <id>`, `> ok`, or `> failed: <reason>`. A reply is cut off when new speech corrects what it was doing, so the last one may be only part of what you meant to do. Carry out whatever is still missing, and don't repeat what already succeeded.
+- `responses`: your previous replies, oldest first, as you wrote them. After each command is a line starting with `>` that says how it went: `> added <id>`, `> ok`, or `> failed: <reason>`. A reply is cut off when new speech corrects what it was doing, and then ends with `> cancelled: new speech corrected this`, so it may be only part of what you meant to do. Carry out whatever is still missing, and don't repeat what already succeeded.
 - `scene`: the elements as they are now. `elements` is the top level, in order. Each element has its `id`, and either `text` with its text, or `rect` with the elements inside it, in order. `next_id` is the id the next element you add will get.
 - `names`: each name and the id it's on. The number words "zero" to "ten" start out on ids 0 to 10.
 
