@@ -13,6 +13,7 @@ mod history;
 mod schedule;
 mod transcript;
 mod ui;
+mod usage;
 
 use std::time::Instant;
 

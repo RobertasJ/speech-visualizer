@@ -75,6 +75,9 @@ separate display window, by writing Rhai scripts.
     `agent/input.rs` is its first message and system prompt (`agent/preamble.md`),
     `agent/reply.rs` follows a streamed reply, `agent/tools.rs` is the tool.
   - `live/history.rs`: what each run did; shown on screen, and sent back as text.
+  - `live/usage.rs`: the tokens each request used, priced from Anthropic's list prices
+    per model (Haiku 5.5 is dearer per request over 100K prompt tokens), summed per run
+    and in total. Update the prices there when the model or its pricing changes.
   - `live/ui/`: `TranscriptPanel` and `ActivityPanel`, the live screen's debug view.
 - `typesafeai.rs`: the TypeSafe AI client, with Noul, Choice and Score questions.
 - `options.rs`: the choices made on the selection screen.

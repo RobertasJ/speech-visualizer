@@ -4,6 +4,7 @@
 use std::fmt::Write;
 use std::time::{Duration, Instant};
 
+use super::usage::Usage;
 use crate::scene::Outcome;
 
 /// The agent's runs, oldest first.
@@ -23,6 +24,8 @@ pub struct Run {
     pub first_output: Option<Duration>,
     /// How long it took in all, once it's over.
     pub took: Option<Duration>,
+    /// What its requests used, and cost.
+    pub usage: Usage,
 }
 
 /// Something the agent did in a run.
@@ -54,6 +57,7 @@ impl History {
             started: Instant::now(),
             first_output: None,
             took: None,
+            usage: Usage::default(),
         });
     }
 
@@ -68,6 +72,22 @@ impl History {
     pub fn cancelled(&mut self) {
         self.push(Entry::Cancelled);
         self.end();
+    }
+
+    /// A request in the latest run finished, having used `usage`.
+    pub fn used(&mut self, usage: Usage) {
+        if let Some(run) = self.runs.last_mut() {
+            run.usage += usage;
+        }
+    }
+
+    /// What every run used, and cost.
+    pub fn total(&self) -> Usage {
+        let mut total = Usage::default();
+        for run in &self.runs {
+            total += run.usage;
+        }
+        total
     }
 
     /// A request in the latest run failed.
@@ -264,6 +284,30 @@ mod tests {
                 "> failed: overloaded\n",
             ]
         );
+    }
+
+    #[test]
+    fn usage_adds_up_per_run_and_in_total() {
+        let used = |input, output| Usage {
+            requests: 1,
+            input,
+            output,
+            dollars: Some(0.5),
+            ..Usage::default()
+        };
+        let mut history = History::default();
+        history.begin("add a box".into());
+        history.used(used(100, 10));
+        history.used(used(200, 20));
+        history.begin("make it red".into());
+        history.used(used(50, 5));
+
+        let first = history.runs()[0].usage;
+        assert_eq!((first.requests, first.input, first.output), (2, 300, 30));
+        assert_eq!(first.dollars, Some(1.));
+        let total = history.total();
+        assert_eq!((total.requests, total.input, total.output), (3, 350, 35));
+        assert_eq!(total.dollars, Some(1.5));
     }
 
     #[test]

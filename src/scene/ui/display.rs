@@ -1,5 +1,6 @@
 use std::rc::Rc;
 
+use freya::elements::paragraph::ParagraphContent;
 use freya::prelude::*;
 use freya::winit::window::Fullscreen;
 
@@ -70,6 +71,9 @@ fn view(scene: &Scene, id: ElementId) -> Element {
                     _ => None,
                 })
                 .collect();
+            // Freya draws what `contents` lists, in order, taking the next span for each
+            // `Span` in it.
+            paragraph.contents = vec![ParagraphContent::Span; paragraph.spans.len()];
             Element::Element {
                 key,
                 element: Rc::new(paragraph),
@@ -137,6 +141,7 @@ mod tests {
         assert_eq!(drawn.max_lines, Some(2));
         let texts: Vec<&str> = drawn.spans.iter().map(|span| span.text.as_ref()).collect();
         assert_eq!(texts, ["Hello ", "world"]);
+        assert!(drawn.contents == [ParagraphContent::Span, ParagraphContent::Span]);
         assert_eq!(
             drawn.spans[0].text_style_data.font_weight,
             Some(FontWeight::BOLD)

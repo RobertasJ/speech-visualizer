@@ -17,6 +17,7 @@ use rig::streaming::Item;
 pub use input::Input;
 
 use super::history::History;
+use super::usage;
 use crate::scene::{Scene, Script};
 use reply::Reply;
 
@@ -93,6 +94,7 @@ async fn request(
         history.write().ran(code, outcome);
     }
     let response = stream.finish().await.map_err(|err| err.to_string())?;
+    history.write().used(usage::request(MODEL, &response.usage));
     Ok((response.message(), results))
 }
 

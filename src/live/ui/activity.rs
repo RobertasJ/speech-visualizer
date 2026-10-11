@@ -1,6 +1,6 @@
 use freya::prelude::*;
 
-use super::{duration_text, follow_end, heading};
+use super::{duration_text, follow_end, heading, usage_text};
 use crate::live::history::{Entry, History, Run};
 use crate::live::schedule::Schedule;
 use crate::live::transcript::Transcript;
@@ -28,6 +28,7 @@ impl Component for ActivityPanel {
         let colors = use_theme().read().colors.clone();
 
         let history = history.read();
+        let total = history.total();
         let mut activity = vec!["Agent".to_owned()];
         if history.runs().last().is_some_and(Run::is_running) {
             activity.push("thinking…".to_owned());
@@ -76,6 +77,9 @@ impl Component for ActivityPanel {
                     .height(Size::flex(1.))
                     .child(body),
             )
+            .children((total.requests > 0).then(|| {
+                heading(format!("Total · {}", usage_text(&total)), &colors).into_element()
+            }))
     }
 }
 
@@ -89,6 +93,9 @@ fn run_view(index: usize, run: &Run, colors: &ColorsSheet) -> Element {
         Some(took) => format!("took {}", duration_text(took)),
         None => "running…".to_owned(),
     });
+    if run.usage.requests > 0 {
+        about.push(usage_text(&run.usage));
+    }
     let entries = run
         .entries
         .iter()
@@ -198,6 +205,7 @@ mod tests {
 
     use super::*;
     use crate::live::ui::tests::labels;
+    use crate::live::usage::Usage;
 
     fn panel() -> impl IntoElement {
         use_init_theme(Theme::default);
@@ -327,6 +335,36 @@ mod tests {
                 .iter()
                 .any(|label| label.starts_with("run 1 · ") && label.contains("took "))
         );
+    }
+
+    #[test]
+    fn shows_what_each_run_used_and_the_total() {
+        let (mut test, (history, ..)) = runner();
+        let used = Usage {
+            requests: 1,
+            input: 1_200,
+            output: 80,
+            dollars: Some(0.00016),
+            ..Usage::default()
+        };
+        test.run_in(|| {
+            let mut history = history;
+            let mut history = history.write();
+            history.begin("add a box".into());
+            history.used(used);
+            history.used(used);
+            history.end();
+        });
+        let labels = labels_of(&mut test);
+        assert!(
+            labels.iter().any(|label| label.starts_with("run 1 · ")
+                && label.ends_with("2 requests · 2,400 in · 160 out · $0.0003")),
+            "{labels:?}"
+        );
+        assert!(has(
+            &labels,
+            "Total · 2 requests · 2,400 in · 160 out · $0.0003"
+        ));
     }
 
     #[test]
