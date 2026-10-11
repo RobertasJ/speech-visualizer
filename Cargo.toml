@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = []                   # CPU; enable `cuda` or `vulkan` for GPU
+default = []                   # CPU; enable `cuda`, `vulkan` or `coreml` for GPU
 cuda = ["whisper-rs/cuda"]
 vulkan = ["whisper-rs/vulkan"]
+coreml = ["whisper-rs/coreml"] # macOS; uses models/ggml-*-encoder.mlmodelc if there
 
 [dependencies]
 cpal = "0.18"

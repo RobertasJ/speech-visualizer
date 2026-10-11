@@ -11,9 +11,11 @@ separate display window, by writing Rhai scripts.
 - Version control is jj, colocated with git. Use `jj` commands, not `git`.
 - The dev shell comes from `flake.nix` via direnv (bindgen, CUDA, Vulkan env vars).
 - Commands are in the `justfile`: `just run`, `just run-cuda`, `just run-vulkan`,
-  `just clippy`, `just fmt`. Tests: `cargo test`.
+  `just run-coreml` (macOS), `just clippy`, `just fmt`. Tests: `cargo test`.
 - Models (`ggml-*.bin`) live in `models/`, which is gitignored. The first CLI arg
-  overrides the directory. Files with "silero" in the name are VAD models.
+  overrides the directory. Files with "silero" in the name are VAD models. With
+  `coreml`, whisper.cpp uses a model's Core ML encoder (`ggml-<model>-encoder.mlmodelc`)
+  from the same folder if it's there, and runs on the CPU if not.
 
 ## Layout
 

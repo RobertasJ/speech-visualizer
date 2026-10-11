@@ -29,6 +29,14 @@ build-vulkan:
 run-vulkan *args:
     cargo run --features vulkan -- {{args}}
 
+# Build with Core ML (macOS)
+build-coreml:
+    cargo build --features coreml
+
+# Run with Core ML (macOS)
+run-coreml *args:
+    cargo run --features coreml -- {{args}}
+
 check:
     cargo check
 
